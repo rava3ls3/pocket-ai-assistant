@@ -139,60 +139,89 @@ void showScreen(const String &title, const String &body) {
   display.display();
 }
 
-// Ekspresi wajah robot yang bisa digambar
-enum RobotExpression { FACE_NEUTRAL, FACE_SAD };
+// Ekspresi & arah lirikan wajah robot yang bisa digambar
+enum RobotExpression { FACE_NEUTRAL, FACE_SAD, FACE_HAPPY, FACE_THINKING };
+enum LookDir { LOOK_CENTER, LOOK_LEFT, LOOK_RIGHT };
+
+// Mata "senang": chevron melengkung ke atas ( ^ ), dipakai utk FACE_HAPPY
+// dan juga saat mata "tersenyum menyipit".
+void drawChevronEye(int x, int y) {
+  display.drawLine(x, y + 5, x + 5, y, SSD1306_WHITE);
+  display.drawLine(x + 5, y, x + 10, y + 5, SSD1306_WHITE);
+}
 
 // ---------------------------------------------------------
-// Wajah robot sederhana (digambar pakai primitif Adafruit_GFX, tanpa perlu
-// file bitmap terpisah). Dipakai untuk layar standby/idle (netral) dan
-// layar WiFi gagal (sedih).
+// Wajah robot (digambar pakai primitif Adafruit_GFX, tanpa perlu file
+// bitmap terpisah) -- dipakai di layar standby/idle, WiFi gagal, dan
+// sekilas transisi "mikir"/"senang". Mendukung beberapa ekspresi, arah
+// lirikan mata (kiri/kanan/tengah), dan kedipan, supaya tidak terasa
+// statis saat idle lama.
 // ---------------------------------------------------------
-void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL) {
+void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL,
+                    LookDir look = LOOK_CENTER, bool blinking = false) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
   const int headW = 56, headH = 44;
   const int headX = (SCREEN_WIDTH - headW) / 2;  // 36
   const int headY = 4;
+  const int antX = SCREEN_WIDTH / 2;
 
-  if (expr == FACE_NEUTRAL) {
-    // Antena tegak - ekspresi siap/netral
-    int antX = SCREEN_WIDTH / 2;
-    display.drawLine(antX, headY - 6, antX, headY, SSD1306_WHITE);
-    display.fillCircle(antX, headY - 8, 2, SSD1306_WHITE);
-  } else {
-    // Antena terkulai - ekspresi sedih/lesu
-    int antX = SCREEN_WIDTH / 2;
+  // Antena: terkulai saat sedih, tegak selain itu
+  if (expr == FACE_SAD) {
     display.drawLine(antX, headY, antX - 5, headY - 6, SSD1306_WHITE);
     display.fillCircle(antX - 5, headY - 6, 2, SSD1306_WHITE);
+  } else {
+    display.drawLine(antX, headY - 6, antX, headY, SSD1306_WHITE);
+    display.fillCircle(antX, headY - 8, 2, SSD1306_WHITE);
   }
 
   // Kepala
   display.drawRoundRect(headX, headY, headW, headH, 8, SSD1306_WHITE);
 
+  // Mata digeser kiri/kanan sedikit untuk kesan "melirik"
+  int eyeShift = (look == LOOK_LEFT) ? -3 : (look == LOOK_RIGHT) ? 3 : 0;
   int eyeY = headY + 14;
-  if (expr == FACE_NEUTRAL) {
-    // Mata: dua kotak membulat
-    display.fillRoundRect(headX + 11, eyeY, 10, 14, 3, SSD1306_WHITE);
-    display.fillRoundRect(headX + headW - 21, eyeY, 10, 14, 3, SSD1306_WHITE);
+  int lEyeX = headX + 11 + eyeShift;
+  int rEyeX = headX + headW - 21 + eyeShift;
+  const int EW = 10, EH = 14;
+
+  if (expr == FACE_SAD) {
+    // Mata sedih: "X" di tiap mata (abaikan arah lirik/kedip)
+    display.drawLine(lEyeX, eyeY, lEyeX + EW, eyeY + EH, SSD1306_WHITE);
+    display.drawLine(lEyeX + EW, eyeY, lEyeX, eyeY + EH, SSD1306_WHITE);
+    display.drawLine(rEyeX, eyeY, rEyeX + EW, eyeY + EH, SSD1306_WHITE);
+    display.drawLine(rEyeX + EW, eyeY, rEyeX, eyeY + EH, SSD1306_WHITE);
+  } else if (blinking) {
+    // Mata terpejam: garis tipis datar
+    display.drawLine(lEyeX, eyeY + 7, lEyeX + EW, eyeY + 7, SSD1306_WHITE);
+    display.drawLine(rEyeX, eyeY + 7, rEyeX + EW, eyeY + 7, SSD1306_WHITE);
+  } else if (expr == FACE_HAPPY) {
+    // Mata senang: chevron melengkung ( ^ ^ )
+    drawChevronEye(lEyeX, eyeY + 7);
+    drawChevronEye(rEyeX, eyeY + 7);
   } else {
-    // Mata sedih: "X" di tiap mata
-    int exL = headX + 11, exR = headX + headW - 21, ew = 10, eh = 14;
-    display.drawLine(exL, eyeY, exL + ew, eyeY + eh, SSD1306_WHITE);
-    display.drawLine(exL + ew, eyeY, exL, eyeY + eh, SSD1306_WHITE);
-    display.drawLine(exR, eyeY, exR + ew, eyeY + eh, SSD1306_WHITE);
-    display.drawLine(exR + ew, eyeY, exR, eyeY + eh, SSD1306_WHITE);
+    // Mata normal: kotak membulat terisi penuh
+    display.fillRoundRect(lEyeX, eyeY, EW, EH, 3, SSD1306_WHITE);
+    display.fillRoundRect(rEyeX, eyeY, EW, EH, 3, SSD1306_WHITE);
   }
 
   int mouthY = headY + headH - 10;
-  if (expr == FACE_NEUTRAL) {
-    // Mulut: garis datar simpel
-    display.drawLine(headX + 16, mouthY, headX + headW - 16, mouthY, SSD1306_WHITE);
-  } else {
-    // Mulut sedih: lengkungan terbalik (cemberut)
-    int mcx = headX + headW / 2;
+  int mcx = headX + headW / 2;
+  if (expr == FACE_SAD) {
+    // Cemberut: lengkungan terbalik
     display.drawLine(headX + 16, mouthY + 4, mcx, mouthY, SSD1306_WHITE);
     display.drawLine(mcx, mouthY, headX + headW - 16, mouthY + 4, SSD1306_WHITE);
+  } else if (expr == FACE_HAPPY) {
+    // Senyum: lengkungan normal
+    display.drawLine(headX + 16, mouthY, mcx, mouthY + 5, SSD1306_WHITE);
+    display.drawLine(mcx, mouthY + 5, headX + headW - 16, mouthY, SSD1306_WHITE);
+  } else if (expr == FACE_THINKING) {
+    // Bingung: mulut miring sebelah (skeptis)
+    display.drawLine(headX + 18, mouthY, headX + headW - 14, mouthY - 3, SSD1306_WHITE);
+  } else {
+    // Netral: garis datar simpel
+    display.drawLine(headX + 16, mouthY, headX + headW - 16, mouthY, SSD1306_WHITE);
   }
 
   // Caption singkat di bawah wajah
@@ -201,6 +230,59 @@ void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL) {
   display.println(caption);
 
   display.display();
+}
+
+// ---------------------------------------------------------
+// Animasi idle: kedip & lirik kiri-kanan acak selama di layar standby,
+// supaya wajahnya "hidup" alih-alih diam saja. Dipanggil tiap loop() saat
+// state == STATE_IDLE; hanya redraw layar kalau ada perubahan.
+// ---------------------------------------------------------
+unsigned long nextBlinkAt = 0;
+unsigned long nextLookAt = 0;
+unsigned long blinkEndAt = 0;
+unsigned long lookEndAt = 0;
+bool idleBlinking = false;
+LookDir idleLook = LOOK_CENTER;
+
+void scheduleIdleAnim() {
+  unsigned long now = millis();
+  nextBlinkAt = now + random(1500, 4000);
+  nextLookAt = now + random(2500, 6000);
+  idleBlinking = false;
+  idleLook = LOOK_CENTER;
+}
+
+void updateIdleFace() {
+  unsigned long now = millis();
+  bool changed = false;
+
+  if (idleBlinking) {
+    if (now >= blinkEndAt) {
+      idleBlinking = false;
+      nextBlinkAt = now + random(2000, 6000);
+      changed = true;
+    }
+  } else if (now >= nextBlinkAt) {
+    idleBlinking = true;
+    blinkEndAt = now + 150;
+    changed = true;
+  }
+
+  if (idleLook != LOOK_CENTER) {
+    if (now >= lookEndAt) {
+      idleLook = LOOK_CENTER;
+      nextLookAt = now + random(3000, 7000);
+      changed = true;
+    }
+  } else if (now >= nextLookAt) {
+    idleLook = (random(0, 2) == 0) ? LOOK_LEFT : LOOK_RIGHT;
+    lookEndAt = now + random(600, 1200);
+    changed = true;
+  }
+
+  if (changed) {
+    drawRobotFace("Siap! Tekan tombol", FACE_NEUTRAL, idleLook, idleBlinking);
+  }
 }
 
 void setLed(bool on) {
@@ -310,6 +392,7 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi tersambung, IP: " + WiFi.localIP().toString());
     drawRobotFace("Siap! Tekan tombol");
+    scheduleIdleAnim();
   } else {
     Serial.println("WiFi GAGAL tersambung.");
     drawRobotFace("WiFi gagal :(", FACE_SAD);
@@ -424,6 +507,18 @@ void haNotify(const String &question, const String &answer) {
 void enterThinking(const String &question) {
   state = STATE_THINKING;
   setLed(true);
+
+  // Animasi singkat "mikir" (lirik kiri-kanan, lalu kedip) sebelum masuk ke
+  // layar teks yang menampilkan pertanyaan -- biar transisinya tidak kaku.
+  // Dipakai delay() pendek karena ini cuma sekilas (~700ms total), bukan
+  // animasi berkelanjutan selama nunggu respons API yang (blocking).
+  drawRobotFace("Mikir...", FACE_THINKING, LOOK_LEFT);
+  delay(250);
+  drawRobotFace("Mikir...", FACE_THINKING, LOOK_RIGHT);
+  delay(250);
+  drawRobotFace("Mikir...", FACE_THINKING, LOOK_CENTER, true);
+  delay(180);
+
   showScreen("Thinking...", question);
   Serial.println("Mengirim ke NVIDIA NIM API: \"" + question + "\"");
 
@@ -438,6 +533,11 @@ void enterThinking(const String &question) {
   haNotify(question, answer);
 
   setLed(false);
+
+  // Kilas senang sebentar begitu jawaban datang, sebelum tampil teksnya.
+  drawRobotFace("Ketemu!", FACE_HAPPY);
+  delay(600);
+
   state = STATE_ANSWERED;
   answeredAtTimer = millis();
   showScreen("Jawaban:", answer);
@@ -452,6 +552,8 @@ void setup() {
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
+
+  randomSeed(esp_random());  // biar animasi idle (kedip/lirik) tidak selalu pola sama
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
@@ -530,5 +632,11 @@ void loop() {
   if (state == STATE_ANSWERED && millis() - answeredAtTimer > ANSWERED_TIMEOUT_MS) {
     state = STATE_IDLE;
     drawRobotFace("Siap! Tekan tombol");
+    scheduleIdleAnim();
+  }
+
+  // --- Animasi idle (kedip & lirik kiri-kanan) selama standby ---
+  if (state == STATE_IDLE) {
+    updateIdleFace();
   }
 }

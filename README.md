@@ -34,7 +34,8 @@ benar-benar memanggil internet lewat gateway Wokwi.
 ## Cara kerja
 
 ```
-[Standby] wajah robot netral di OLED, nunggu tombol / pertanyaan dari HP
+[Standby] wajah robot netral di OLED (kedip & lirik kiri-kanan acak,
+          tidak diam saja), nunggu tombol / pertanyaan dari HP
       |
       v
 [Tombol ditekan] -> status LISTENING (LED kedip)
@@ -43,11 +44,12 @@ benar-benar memanggil internet lewat gateway Wokwi.
 Ketik pertanyaan di Serial Monitor, tekan Enter
       |                                         \
       v                                          \ (opsional, lewat HP)
-status THINKING (LED nyala) -> panggil NVIDIA     Ketik di app HA Companion
-NIM API (Nemotron) via WiFi+HTTPS                 -> HA tulis ke Firebase
-                                                   -> ESP32 polling & deteksi
+wajah "Mikir..." sekilas (lirik kiri/kanan,       Ketik di app HA Companion
+lalu kedip) -> status THINKING (LED nyala)        -> HA tulis ke Firebase
+-> panggil NVIDIA NIM API (Nemotron)              -> ESP32 polling & deteksi
       |                                          /
       v                                         /
+wajah "Ketemu!" (senang) sekilas, lalu:
 Jawaban ditampilkan di OLED (ringkas, word-wrap 6 baris)
 + dicetak penuh di Serial Monitor
 + (kalau HA dikonfigurasi) dikirim sebagai notifikasi ke app HA Companion di HP
@@ -58,7 +60,23 @@ tunggu 15 detik -> otomatis balik ke wajah robot standby
 ```
 
 Kalau WiFi gagal connect, OLED menampilkan wajah robot sedih (mata "X",
-mulut cemberut) alih-alih teks error biasa.
+mulut cemberut, antena terkulai) alih-alih teks error biasa.
+
+### Wajah robot interaktif
+
+Wajah di layar standby tidak statis — ada animasi idle acak biar terasa
+"hidup":
+- **Kedip** tiap beberapa detik (mata jadi garis tipis sesaat)
+- **Lirik kiri/kanan** sesekali (mata bergeser dari posisi tengah)
+
+Ekspresi lain (semua digambar pakai primitif `Adafruit_GFX`, tanpa file
+gambar/bitmap terpisah):
+| Ekspresi | Kapan muncul | Ciri |
+|---|---|---|
+| Netral | Standby | Mata kotak membulat, mulut datar |
+| **Mikir** | Sekilas (~700ms) saat mulai memproses pertanyaan | Mulut miring, mata lirik kiri→kanan→kedip |
+| **Senang** | Sekilas (~600ms) begitu jawaban diterima | Mata melengkung "^ ^", senyum |
+| **Sedih** | WiFi gagal connect | Mata "X", mulut cemberut, antena terkulai |
 
 ## Struktur file
 
