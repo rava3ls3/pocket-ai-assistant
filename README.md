@@ -71,6 +71,10 @@ pocket-ai-assistant/
 │   ├── main.cpp           # firmware utama
 │   ├── secrets.h.example  # template WiFi + API key (salin jadi secrets.h)
 │   └── secrets.h          # (dibuat sendiri, di-gitignore, isi API key asli)
+├── web/
+│   └── index.html         # halaman web opsional (lihat bawah), deploy ke Firebase Hosting
+├── firebase.json          # konfigurasi Firebase Hosting
+├── .firebaserc            # project ID Firebase default
 └── .gitignore
 ```
 
@@ -226,6 +230,28 @@ juga tetap mengirim notifikasi yang sama ke HP.
 
 Kosongkan `FIREBASE_DB_URL` (`""`) di `secrets.h` untuk mematikan fitur ini
 — firmware tetap jalan normal lewat tombol+Serial+OLED saja.
+
+### Alternatif/tambahan: halaman web sendiri (Firebase Hosting)
+
+Selain lewat app HA Companion, ada juga halaman web ringan (`web/index.html`)
+yang di-deploy ke **Firebase Hosting** — dapat URL permanen gratis seperti
+`https://<project-id>.web.app`. Halaman ini connect **langsung** ke Firebase
+Realtime Database yang sama (bukan lewat HA sama sekali), jadi:
+
+- Tidak perlu app HA Companion / buka Settings → Helpers
+- Jawaban muncul **real-time** (pakai Server-Sent Events bawaan REST API
+  Firebase, bukan polling) begitu ESP32 selesai menjawab
+- Bisa dibuka dari browser mana saja (HP/PC), tanpa install apa pun
+
+Deploy (sekali saja, butuh akun Firebase + `firebase login` di
+[Firebase CLI](https://firebase.google.com/docs/cli)):
+```bash
+firebase deploy --only hosting --project <project-id-kamu>
+```
+`web/index.html` berisi `DB_URL` dan `SECRET_PATH` yang di-hardcode langsung
+di JavaScript sisi klien (sengaja, karena path rahasia itu sendiri yang
+jadi "kunci" akses — lihat security rules di atas) — ganti dengan punyamu
+sebelum deploy.
 
 ## Catatan teknis
 

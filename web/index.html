@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pocket AI Assistant</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #1a1d24;
+    --border: #2a2e38;
+    --text: #e6e8ec;
+    --text-dim: #9aa0ab;
+    --accent: #5b8cff;
+    --accent-dim: #2d3f6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 24px 16px;
+  }
+  .card {
+    width: 100%;
+    max-width: 480px;
+  }
+  h1 {
+    font-size: 1.3rem;
+    margin: 0 0 4px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    margin-bottom: 24px;
+  }
+  textarea {
+    width: 100%;
+    min-height: 90px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    color: var(--text);
+    padding: 14px;
+    font-size: 1rem;
+    font-family: inherit;
+    resize: vertical;
+  }
+  textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  button {
+    width: 100%;
+    margin-top: 12px;
+    padding: 14px;
+    border: none;
+    border-radius: 12px;
+    background: var(--accent);
+    color: white;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: var(--accent-dim);
+    cursor: not-allowed;
+  }
+  .status {
+    margin-top: 20px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 20px;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+  }
+  .dot.live { background: #4caf50; }
+  .dot.waiting { background: #f0ad4e; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+  .answer-box {
+    margin-top: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+    min-height: 60px;
+    display: none;
+  }
+  .answer-box.show { display: block; }
+  .answer-q {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    margin-bottom: 8px;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🤖 Pocket AI Assistant</h1>
+    <div class="subtitle">Terhubung ke device ESP32 lewat Firebase — tidak dibatasi layar OLED</div>
+
+    <textarea id="question" placeholder="Ketik pertanyaan di sini..." autofocus></textarea>
+    <button id="askBtn">Kirim ke Pocket AI</button>
+
+    <div class="status">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Menyambungkan...</span>
+    </div>
+
+    <div class="answer-box" id="answerBox">
+      <div class="answer-q" id="answerQ"></div>
+      <div id="answerText"></div>
+    </div>
+  </div>
+
+<script>
+  // Konfigurasi ini SENGAJA ditaruh di sisi klien -- path rahasia ini
+  // (bukan API key) yang berperan sebagai "kunci" akses, dan Security
+  // Rules Firebase membatasi baca/tulis hanya di path ini. Lihat README
+  // project "pocket-ai-assistant" untuk detail arsitekturnya.
+  const DB_URL = "https://ai-asisst-ha-default-rtdb.asia-southeast1.firebasedatabase.app";
+  const SECRET_PATH = "pocket_ai_396274fc87cb4f3cd582d22f9354c990";
+
+  const questionEl = document.getElementById("question");
+  const askBtn = document.getElementById("askBtn");
+  const statusDot = document.getElementById("statusDot");
+  const statusText = document.getElementById("statusText");
+  const answerBox = document.getElementById("answerBox");
+  const answerQ = document.getElementById("answerQ");
+  const answerText = document.getElementById("answerText");
+
+  function setStatus(text, mode) {
+    statusText.textContent = text;
+    statusDot.className = "dot" + (mode ? " " + mode : "");
+  }
+
+  async function askQuestion() {
+    const q = questionEl.value.trim();
+    if (!q) return;
+
+    askBtn.disabled = true;
+    answerBox.classList.remove("show");
+    setStatus("Mengirim pertanyaan...", "waiting");
+
+    try {
+      await fetch(`${DB_URL}/${SECRET_PATH}/question.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(q),
+      });
+      answerQ.textContent = "T: " + q;
+      setStatus("Menunggu jawaban dari ESP32 / Nemotron...", "waiting");
+    } catch (e) {
+      setStatus("Gagal mengirim: " + e.message, "");
+      askBtn.disabled = false;
+    }
+  }
+
+  askBtn.addEventListener("click", askQuestion);
+  questionEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) askQuestion();
+  });
+
+  // Dengarkan perubahan jawaban secara real-time lewat Server-Sent Events
+  // (fitur bawaan REST API Firebase Realtime Database -- tidak perlu SDK).
+  function listenForAnswer() {
+    const es = new EventSource(`${DB_URL}/${SECRET_PATH}/answer.json`);
+
+    es.onopen = () => setStatus("Siap. Ketik pertanyaan di atas.", "live");
+
+    es.addEventListener("put", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const value = data.data;
+        if (value !== null && value !== undefined) {
+          answerText.textContent = value;
+          answerBox.classList.add("show");
+          setStatus("Jawaban diterima.", "live");
+          askBtn.disabled = false;
+        }
+      } catch (e) {
+        console.error("Gagal parse event jawaban:", e);
+      }
+    });
+
+    es.onerror = () => {
+      setStatus("Koneksi terputus, mencoba lagi...", "");
+      es.close();
+      setTimeout(listenForAnswer, 3000);
+    };
+  }
+
+  listenForAnswer();
+</script>
+</body>
+</html>

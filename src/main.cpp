@@ -363,7 +363,10 @@ String haGetQuestion() {
   HTTPClient https;
   String result;
 
-  if (https.begin(client, firebasePath("question"))) {
+  // Query param acak (cache-buster) -- jaga-jaga terhadap kemungkinan
+  // caching di jalur GET (proxy/gateway), supaya tidak dapat respons basi.
+  String url = firebasePath("question") + "?cb=" + String(millis());
+  if (https.begin(client, url)) {
     int code = https.GET();
     if (code == 200) {
       String payload = https.getString();
