@@ -72,6 +72,11 @@ unsigned long haPollTimer = 0;
 static const unsigned long HA_POLL_INTERVAL_MS = 4000;
 String lastHaQuestion = "";
 
+// Auto-kembali ke standby (wajah robot) kalau tidak ada aktivitas setelah
+// jawaban ditampilkan.
+unsigned long answeredAtTimer = 0;
+static const unsigned long ANSWERED_TIMEOUT_MS = 15000;
+
 // ---------------------------------------------------------
 // Util tampilan: tulis judul status + body teks dengan word-wrap sederhana.
 // Two-pass: kumpulkan dulu baris-baris hasil wrap ke array (maks
@@ -423,6 +428,7 @@ void enterThinking(const String &question) {
 
   setLed(false);
   state = STATE_ANSWERED;
+  answeredAtTimer = millis();
   showScreen("Jawaban:", answer);
 }
 
@@ -507,5 +513,11 @@ void loop() {
       enterThinking(q);
       haClearQuestion();
     }
+  }
+
+  // --- Auto-kembali ke standby (wajah robot) kalau tidak ada aktivitas ---
+  if (state == STATE_ANSWERED && millis() - answeredAtTimer > ANSWERED_TIMEOUT_MS) {
+    state = STATE_IDLE;
+    drawRobotFace("Siap! Tekan tombol");
   }
 }

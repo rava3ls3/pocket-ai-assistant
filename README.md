@@ -52,7 +52,8 @@ Jawaban ditampilkan di OLED (ringkas, word-wrap 6 baris)
 + (kalau HA dikonfigurasi) dikirim sebagai notifikasi ke app HA Companion di HP
       |
       v
-Tekan tombol lagi untuk bertanya hal baru
+Tekan tombol lagi untuk bertanya hal baru, ATAU
+tunggu 15 detik -> otomatis balik ke wajah robot standby
 ```
 
 Kalau WiFi gagal connect, OLED menampilkan wajah robot sedih (mata "X",
