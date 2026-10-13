@@ -34,20 +34,29 @@ benar-benar memanggil internet lewat gateway Wokwi.
 ## Cara kerja
 
 ```
+[Standby] wajah robot netral di OLED, nunggu tombol / pertanyaan dari HP
+      |
+      v
 [Tombol ditekan] -> status LISTENING (LED kedip)
       |
       v
 Ketik pertanyaan di Serial Monitor, tekan Enter
-      |
-      v
-status THINKING (LED nyala terus) -> panggil NVIDIA NIM API (Nemotron) via WiFi+HTTPS
-      |
-      v
-Jawaban ditampilkan di OLED (ringkas) + Serial Monitor (lengkap)
+      |                                         \
+      v                                          \ (opsional, lewat HP)
+status THINKING (LED nyala) -> panggil NVIDIA     Ketik di app HA Companion
+NIM API (Nemotron) via WiFi+HTTPS                 -> ESP32 polling & deteksi
+      |                                          /
+      v                                         /
+Jawaban ditampilkan di OLED (ringkas, word-wrap 6 baris)
++ dicetak penuh di Serial Monitor
++ (kalau HA dikonfigurasi) dikirim sebagai notifikasi ke app HA Companion di HP
       |
       v
 Tekan tombol lagi untuk bertanya hal baru
 ```
+
+Kalau WiFi gagal connect, OLED menampilkan wajah robot sedih (mata "X",
+mulut cemberut) alih-alih teks error biasa.
 
 ## Struktur file
 
@@ -94,6 +103,35 @@ pocket-ai-assistant/
    Jawaban lengkap selalu tercetak penuh di Serial Monitor.
 5. Tekan tombol lagi untuk bertanya hal lain.
 
+## Tanya/baca jawaban panjang lewat HP (opsional, via Home Assistant)
+
+Layar OLED kecil (128x64) cuma muat ~6 baris teks. Kalau mau tanya/baca
+panjang tanpa batas itu, ada jalur opsional lewat **app Home Assistant
+Companion** di HP — tidak perlu bikin app Android sendiri:
+
+1. **Home Assistant harus bisa diakses dari internet** (bukan cuma WiFi
+   rumah), karena ESP32 cuma bisa akses keluar (outbound), tidak bisa
+   dihubungi dari jaringan lokal. Pakai Nabu Casa, reverse proxy sendiri,
+   atau untuk testing: `~/bin/cloudflared tunnel --url http://localhost:8123`
+   (gratis, tapi URL-nya sementara & berubah tiap dijalankan ulang).
+2. Buat 1 helper teks di HA (sekali saja): Settings → Devices & Services →
+   tab **Helpers** → **+ Create Helper** → **Text** → Name: `pocket ai
+   question` → Create. (Max length 255 karakter — ini batas keras bawaan HA,
+   tidak bisa dinaikkan.)
+3. Generate **Long-Lived Access Token**: klik foto profil → Security →
+   Long-Lived Access Tokens → Create Token.
+4. Isi `HA_URL` dan `HA_TOKEN` di `src/secrets.h` (lihat `secrets.h.example`).
+
+Cara pakai: ketik pertanyaan di helper `pocket ai question` lewat dashboard
+app HA Companion di HP → ESP32 mendeteksinya (cek tiap ~4 detik saat tidak
+sibuk) → jawaban lengkap Nemotron dikirim balik sebagai **notifikasi** ke
+app HA Companion-mu, bisa dibaca penuh tanpa batas panjang OLED. Pertanyaan
+lewat tombol+Serial juga tetap mengirim notifikasi yang sama ke HP, jadi
+kamu selalu punya salinan jawaban lengkap di HP.
+
+Kosongkan `HA_URL` (`""`) di `secrets.h` untuk mematikan fitur ini — firmware
+tetap jalan normal lewat tombol+Serial+OLED saja.
+
 ## Catatan teknis
 
 - WiFi memakai SSID **`Wokwi-GUEST`** — ini SSID khusus simulator Wokwi yang
@@ -103,10 +141,11 @@ pocket-ai-assistant/
   mengelola root CA certificate secara manual. Ini **aman untuk
   demo/simulasi** tapi sebaiknya diganti dengan verifikasi sertifikat yang benar
   kalau nanti dipakai di produk sungguhan.
-- Model default: `nvidia/llama-3.3-nemotron-super-49b-v1`. Varian lain (mis.
-  `nemotron-3-super-120b-a12b`, `llama-3.1-nemotron-ultra-253b-v1`) bisa
+- Model default: `nvidia/nemotron-3.5-lightning-30b-a3b`. Varian lain (mis.
+  `nemotron-3-super-120b-a12b`, `nemotron-3-ultra-550b-a55b`) bisa
   dipilih lewat `NVIDIA_MODEL` di `secrets.h` — cek ID persis di katalog
-  build.nvidia.com karena bisa berubah.
+  build.nvidia.com karena bisa berubah (model lama bisa di-retire NVIDIA
+  sewaktu-waktu).
 - Request menyertakan `"chat_template_kwargs": {"thinking": false}` — Nemotron
   3.x adalah model reasoning yang defaultnya menaruh jawaban di field
   `reasoning_content` (bukan `content`) dan bisa menghabiskan `max_tokens`

@@ -67,6 +67,11 @@ bool lastButtonRaw = HIGH;
 unsigned long lastDebounceTime = 0;
 static const unsigned long DEBOUNCE_MS = 40;
 
+// Polling pertanyaan dari HP via Home Assistant (lihat haGetQuestion())
+unsigned long haPollTimer = 0;
+static const unsigned long HA_POLL_INTERVAL_MS = 4000;
+String lastHaQuestion = "";
+
 // ---------------------------------------------------------
 // Util tampilan: tulis judul status + body teks dengan word-wrap sederhana.
 // Two-pass: kumpulkan dulu baris-baris hasil wrap ke array (maks
@@ -314,6 +319,92 @@ void enterListening() {
   showScreen("Listening...", "Ketik pertanyaan di\nSerial Monitor,\nlalu Enter.");
 }
 
+// ---------------------------------------------------------
+// Integrasi opsional dengan Home Assistant, supaya pertanyaan panjang bisa
+// diketik dan jawabannya dibaca penuh lewat app HA Companion di HP (tidak
+// dibatasi layar OLED 128x64). Jalur komunikasinya murni outbound HTTPS dari
+// ESP32 ke HA (REST API), bukan ESPHome native API -- karena native API
+// butuh HA yang connect ke device, yang tidak bisa menembus jaringan
+// simulasi Wokwi. Semua fungsi ini no-op kalau HA_URL belum diisi di
+// secrets.h (lihat secrets.h.example).
+// ---------------------------------------------------------
+bool haConfigured() {
+  return strlen(HA_URL) > 0;
+}
+
+// Ambil isi helper input_text.pocket_ai_question dari HA (hasil ketikan di
+// app HA Companion di HP). String kosong = tidak ada/gagal.
+String haGetQuestion() {
+  if (!haConfigured()) return "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  String result;
+
+  String url = String(HA_URL) + "/api/states/input_text.pocket_ai_question";
+  if (https.begin(client, url)) {
+    https.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+    int code = https.GET();
+    if (code == 200) {
+      JsonDocument doc;
+      if (!deserializeJson(doc, https.getString())) {
+        const char *s = doc["state"];
+        if (s) result = String(s);
+      }
+    }
+    https.end();
+  }
+  return result;
+}
+
+// Kosongkan lagi helper-nya di HA setelah pertanyaannya diproses, supaya
+// tidak terus-terusan ke-trigger ulang oleh nilai yang sama.
+void haClearQuestion() {
+  if (!haConfigured()) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = String(HA_URL) + "/api/services/input_text/set_value";
+  if (https.begin(client, url)) {
+    https.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+    https.addHeader("Content-Type", "application/json");
+    JsonDocument doc;
+    doc["entity_id"] = "input_text.pocket_ai_question";
+    doc["value"] = "";
+    String body;
+    serializeJson(doc, body);
+    https.POST(body);
+    https.end();
+  }
+}
+
+// Kirim jawaban lengkap sebagai persistent_notification -> muncul di lonceng
+// notifikasi app HA Companion di HP, bisa dibaca penuh tanpa batas panjang.
+void haNotify(const String &question, const String &answer) {
+  if (!haConfigured()) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = String(HA_URL) + "/api/services/persistent_notification/create";
+  if (https.begin(client, url)) {
+    https.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+    https.addHeader("Content-Type", "application/json");
+    JsonDocument doc;
+    doc["title"] = "Pocket AI: " + question;
+    doc["message"] = answer;
+    doc["notification_id"] = "pocket_ai_answer";
+    String body;
+    serializeJson(doc, body);
+    https.POST(body);
+    https.end();
+  }
+}
+
 void enterThinking(const String &question) {
   state = STATE_THINKING;
   setLed(true);
@@ -324,6 +415,11 @@ void enterThinking(const String &question) {
 
   Serial.println("Jawaban lengkap:");
   Serial.println(answer);
+
+  // Selalu juga dikirim ke HA (kalau sudah dikonfigurasi) -- baik pertanyaan
+  // datang dari tombol+Serial maupun dari HP, jawabannya tetap bisa dibaca
+  // penuh lewat notifikasi app HA Companion.
+  haNotify(question, answer);
 
   setLed(false);
   state = STATE_ANSWERED;
@@ -389,6 +485,27 @@ void loop() {
       }
     } else {
       inputBuffer += c;
+    }
+  }
+
+  // --- Polling pertanyaan dari HP (lewat helper input_text di HA) ---
+  // Hanya dicek saat device sedang tidak sibuk (IDLE/ANSWERED), supaya tidak
+  // mengganggu alur tombol+Serial yang sedang berjalan.
+  if (haConfigured() &&
+      (state == STATE_IDLE || state == STATE_ANSWERED) &&
+      millis() - haPollTimer > HA_POLL_INTERVAL_MS) {
+    haPollTimer = millis();
+
+    String q = haGetQuestion();
+    q.trim();
+    bool isEmpty = (q.length() == 0 || q == "unknown" || q == "unavailable");
+
+    if (!isEmpty && q != lastHaQuestion) {
+      lastHaQuestion = q;
+      Serial.println();
+      Serial.println("=== Pertanyaan baru dari HP (Home Assistant) ===");
+      enterThinking(q);
+      haClearQuestion();
     }
   }
 }
