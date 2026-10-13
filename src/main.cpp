@@ -45,9 +45,14 @@ static const uint8_t SCREEN_HEIGHT = 64;
 static const int8_t  OLED_RESET    = -1; // tidak dipakai di modul I2C ini
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Tata letak teks: font size 1 ~= 6x8 px -> 21 kolom x 8 baris
-static const uint8_t CHARS_PER_LINE = 21;
-static const uint8_t MAX_LINES      = 8;
+// Tata letak teks: font size 1 ~= 6x8 px -> 21 kolom.
+// Body dimulai di y=12 (setelah judul + garis pemisah) dan layar tinggi 64px,
+// jadi ruang tersisa 52px -> maksimal 6 baris (6*8=48, pas tanpa meluber).
+// (Sebelumnya dipakai 7 baris -> total 68px, meluber 4px dan bikin baris
+// terakhir terlihat "bertumpuk"/terpotong di bagian bawah layar.)
+static const uint8_t CHARS_PER_LINE  = 21;
+static const uint8_t MAX_BODY_LINES  = 6;
+static const int     BODY_START_Y    = 12;
 
 // ---------- State machine ----------
 enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED };
@@ -63,7 +68,12 @@ unsigned long lastDebounceTime = 0;
 static const unsigned long DEBOUNCE_MS = 40;
 
 // ---------------------------------------------------------
-// Util tampilan: tulis judul status + body teks dengan word-wrap sederhana
+// Util tampilan: tulis judul status + body teks dengan word-wrap sederhana.
+// Two-pass: kumpulkan dulu baris-baris hasil wrap ke array (maks
+// MAX_BODY_LINES), baru digambar. Ini mencegah baris meluber ke luar batas
+// layar (yang sebelumnya menyebabkan tampilan terlihat "bertumpuk" saat
+// jawaban panjang) karena jumlah baris + indikator "..." sudah dijatah pasti
+// masuk dalam MAX_BODY_LINES, bukan ditambah di akhir seperti sebelumnya.
 // ---------------------------------------------------------
 void showScreen(const String &title, const String &body) {
   display.clearDisplay();
@@ -74,17 +84,13 @@ void showScreen(const String &title, const String &body) {
   display.println(title);
   display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
 
-  // word-wrap manual, maksimal (MAX_LINES - 1) baris karena 1 baris dipakai judul
-  uint8_t maxBodyLines = MAX_LINES - 1;
+  // --- Pass 1: wrap jadi baris-baris, maksimal MAX_BODY_LINES ---
+  String lines[MAX_BODY_LINES];
   uint8_t lineCount = 0;
-  String line;
   String remaining = body;
   remaining.trim();
 
-  int cursorY = 12;
-  bool truncated = false;
-
-  while (remaining.length() > 0 && lineCount < maxBodyLines) {
+  while (remaining.length() > 0 && lineCount < MAX_BODY_LINES) {
     int spaceIdx = -1;
     if ((int)remaining.length() > CHARS_PER_LINE) {
       // cari spasi terakhir sebelum batas kolom, biar wrap per kata
@@ -102,20 +108,60 @@ void showScreen(const String &title, const String &body) {
       chunk = remaining.substring(0, CHARS_PER_LINE);
       remaining = remaining.substring(CHARS_PER_LINE);
     }
-    display.setCursor(0, cursorY);
-    display.println(chunk);
-    cursorY += 8;
-    lineCount++;
+    lines[lineCount++] = chunk;
   }
 
+  // Kalau masih ada sisa teks setelah MAX_BODY_LINES baris penuh, timpa baris
+  // TERAKHIR dengan indikator "..." (bukan menambah baris baru di bawahnya),
+  // supaya total baris yang digambar tetap <= MAX_BODY_LINES.
   if (remaining.length() > 0) {
-    truncated = true;
+    lines[MAX_BODY_LINES - 1] = "..lengkap di Serial";
   }
 
-  if (truncated) {
+  // --- Pass 2: gambar ---
+  int cursorY = BODY_START_Y;
+  for (uint8_t i = 0; i < lineCount; i++) {
     display.setCursor(0, cursorY);
-    display.println("..lengkap di Serial");
+    display.println(lines[i]);
+    cursorY += 8;
   }
+
+  display.display();
+}
+
+// ---------------------------------------------------------
+// Wajah robot sederhana untuk layar standby/idle (digambar pakai primitif
+// Adafruit_GFX, tanpa perlu file bitmap terpisah).
+// ---------------------------------------------------------
+void drawRobotFace(const String &caption) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  const int headW = 56, headH = 44;
+  const int headX = (SCREEN_WIDTH - headW) / 2;  // 36
+  const int headY = 4;
+
+  // Antena
+  int antX = SCREEN_WIDTH / 2;
+  display.drawLine(antX, headY - 6, antX, headY, SSD1306_WHITE);
+  display.fillCircle(antX, headY - 8, 2, SSD1306_WHITE);
+
+  // Kepala
+  display.drawRoundRect(headX, headY, headW, headH, 8, SSD1306_WHITE);
+
+  // Mata (dua kotak membulat)
+  int eyeY = headY + 14;
+  display.fillRoundRect(headX + 11, eyeY, 10, 14, 3, SSD1306_WHITE);
+  display.fillRoundRect(headX + headW - 21, eyeY, 10, 14, 3, SSD1306_WHITE);
+
+  // Mulut: garis datar simpel (ekspresi "siap/netral")
+  int mouthY = headY + headH - 10;
+  display.drawLine(headX + 16, mouthY, headX + headW - 16, mouthY, SSD1306_WHITE);
+
+  // Caption singkat di bawah wajah
+  display.setTextSize(1);
+  display.setCursor(0, SCREEN_HEIGHT - 8);
+  display.println(caption);
 
   display.display();
 }
@@ -226,7 +272,7 @@ void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi tersambung, IP: " + WiFi.localIP().toString());
-    showScreen("Pocket AI", "WiFi OK. Tekan tombol\nuntuk bertanya.");
+    drawRobotFace("Siap! Tekan tombol");
   } else {
     Serial.println("WiFi GAGAL tersambung.");
     showScreen("Pocket AI", "WiFi gagal. Cek SSID\ndi secrets.h");
