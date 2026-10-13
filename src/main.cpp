@@ -295,7 +295,23 @@ void setLed(bool on) {
 // pesan error). Format request/respons mengikuti konvensi OpenAI-compatible
 // chat completions yang dipakai build.nvidia.com.
 // ---------------------------------------------------------
-String askNvidia(const String &question) {
+// Pembersih markdown sederhana. Modelnya diminta jangan pakai markdown di
+// system prompt, tapi tidak selalu patuh -- jadi dibersihkan programatik
+// di sini juga, supaya notifikasi/OLED tidak kotor simbol ** # dsb.
+void stripMarkdown(String &text) {
+  text.replace("**", "");
+  text.replace("$$", "");
+  text.replace("$", "");
+  text.replace("### ", "");
+  text.replace("## ", "");
+  text.replace("# ", "");
+  text.replace("* ", "- ");
+}
+
+// concise=true (tombol+OLED): dibatasi 3 kalimat karena layar cuma muat
+// ~6 baris. concise=false (lewat HP via HA/web): tidak ada batas layar,
+// jadi boleh jawab lebih lengkap/detail.
+String askNvidia(const String &question, bool concise = true) {
   WiFiClientSecure client;
   client.setInsecure(); // NOTE: skip verifikasi sertifikat TLS -> OK untuk simulasi/demo,
                         // JANGAN dipakai apa adanya untuk produk nyata.
@@ -307,12 +323,20 @@ String askNvidia(const String &question) {
     return "Gagal membuka koneksi HTTPS";
   }
 
+  // Timeout default HTTPClient (~5 detik) sering kurang -- apalagi untuk
+  // jawaban panjang (mode tidak-concise, max_tokens lebih besar) yang makan
+  // waktu generate lebih lama di sisi NVIDIA. Kasih jatah lebih longgar.
+  // ~24 token/detik diamati dari Nemotron Lightning utk jawaban panjang --
+  // kasih jatah waktu yang nyaman di atas estimasi max_tokens / 24.
+  https.setTimeout(concise ? 15000 : 45000);
+  https.setConnectTimeout(10000);
+
   https.addHeader("Content-Type", "application/json");
   https.addHeader("Authorization", String("Bearer ") + NVIDIA_API_KEY);
 
   JsonDocument reqDoc;
   reqDoc["model"] = NVIDIA_MODEL;
-  reqDoc["max_tokens"] = 300;
+  reqDoc["max_tokens"] = concise ? 300 : 800;
   reqDoc["temperature"] = 0.6;
   reqDoc["stream"] = false;
   // Nemotron 3.x adalah model reasoning: tanpa ini, jawabannya ditaruh di
@@ -324,11 +348,23 @@ String askNvidia(const String &question) {
   JsonArray messages = reqDoc["messages"].to<JsonArray>();
   JsonObject sysMsg = messages.add<JsonObject>();
   sysMsg["role"] = "system";
-  sysMsg["content"] =
-      "Kamu adalah asisten AI mini di sebuah perangkat saku (pocket AI "
-      "assistant) dengan layar OLED kecil. Jawab singkat dan jelas, maksimal "
-      "3 kalimat pendek. Gunakan Bahasa Indonesia kecuali ditanya dalam "
-      "bahasa lain.";
+  if (concise) {
+    sysMsg["content"] =
+        "Kamu adalah asisten AI mini di sebuah perangkat saku (pocket AI "
+        "assistant) dengan layar OLED kecil. Jawab singkat dan jelas, "
+        "maksimal 3 kalimat pendek. Gunakan Bahasa Indonesia kecuali "
+        "ditanya dalam bahasa lain.";
+  } else {
+    sysMsg["content"] =
+        "Kamu adalah asisten AI pribadi. Pertanyaan ini datang lewat HP "
+        "(bukan layar kecil), jadi jawab dengan lengkap dan jelas -- boleh "
+        "beberapa kalimat/paragraf kalau memang perlu, tidak perlu dipaksa "
+        "singkat, tapi tetap padat (jangan bertele-tele). PENTING: tulis "
+        "sebagai teks polos biasa saja -- JANGAN pakai markdown (tanpa "
+        "tanda #, **, *, atau heading), karena ini akan tampil sebagai "
+        "notifikasi/pesan teks biasa yang tidak merender markdown. Gunakan "
+        "Bahasa Indonesia kecuali ditanya dalam bahasa lain.";
+  }
   JsonObject userMsg = messages.add<JsonObject>();
   userMsg["role"] = "user";
   userMsg["content"] = question;
@@ -373,6 +409,7 @@ String askNvidia(const String &question) {
   }
 
   https.end();
+  stripMarkdown(answer);
   return answer;
 }
 
@@ -504,7 +541,10 @@ void haNotify(const String &question, const String &answer) {
   }
 }
 
-void enterThinking(const String &question) {
+// concise=true: pertanyaan dari tombol+Serial (OLED kecil, jawaban dipaksa
+// ringkas). concise=false: pertanyaan dari HP lewat HA/Firebase (tidak ada
+// batas layar, jawaban boleh lebih lengkap).
+void enterThinking(const String &question, bool concise = true) {
   state = STATE_THINKING;
   setLed(true);
 
@@ -522,7 +562,7 @@ void enterThinking(const String &question) {
   showScreen("Thinking...", question);
   Serial.println("Mengirim ke NVIDIA NIM API: \"" + question + "\"");
 
-  String answer = askNvidia(question);
+  String answer = askNvidia(question, concise);
 
   Serial.println("Jawaban lengkap:");
   Serial.println(answer);
@@ -623,7 +663,7 @@ void loop() {
       lastHaQuestion = q;
       Serial.println();
       Serial.println("=== Pertanyaan baru dari HP (Home Assistant) ===");
-      enterThinking(q);
+      enterThinking(q, false);  // dari HP -> boleh jawaban lengkap, tidak dipaksa 3 kalimat
       haClearQuestion();
     }
   }

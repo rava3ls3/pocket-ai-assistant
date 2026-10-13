@@ -290,6 +290,16 @@ sebelum deploy.
   `reasoning_content` (bukan `content`) dan bisa menghabiskan `max_tokens`
   hanya untuk proses "berpikir" sampai `content` kosong. Flag ini mematikan
   reasoning supaya langsung jawab singkat dan `content` terisi.
+- **Panjang jawaban beda per jalur**: pertanyaan dari tombol+Serial (OLED
+  kecil) dapat instruksi "maksimal 3 kalimat" + `max_tokens: 300`.
+  Pertanyaan dari HP (HA/web, tidak ada batas layar) dapat instruksi
+  "boleh lengkap" + `max_tokens: 800` — perlu timeout HTTP lebih longgar
+  (45 detik, vs 15 detik utk mode singkat) karena jawaban panjang makan
+  waktu generate lebih lama (~24 token/detik diamati dari Nemotron
+  Lightning). Modelnya juga diminta tidak pakai markdown (supaya tidak
+  tampil simbol `**`/`#` mentah di notifikasi), tapi tidak selalu patuh —
+  jadi ada pembersih markdown sederhana (`stripMarkdown()`) di firmware
+  sebagai jaring pengaman.
 - Pin mapping (lihat `diagram.json`): I2C OLED di GPIO4 (SDA) / GPIO5 (SCL),
   tombol di GPIO3 (aktif LOW), LED status di GPIO10.
 
