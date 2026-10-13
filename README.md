@@ -44,7 +44,8 @@ Ketik pertanyaan di Serial Monitor, tekan Enter
       |                                         \
       v                                          \ (opsional, lewat HP)
 status THINKING (LED nyala) -> panggil NVIDIA     Ketik di app HA Companion
-NIM API (Nemotron) via WiFi+HTTPS                 -> ESP32 polling & deteksi
+NIM API (Nemotron) via WiFi+HTTPS                 -> HA tulis ke Firebase
+                                                   -> ESP32 polling & deteksi
       |                                          /
       v                                         /
 Jawaban ditampilkan di OLED (ringkas, word-wrap 6 baris)
@@ -104,34 +105,127 @@ pocket-ai-assistant/
    Jawaban lengkap selalu tercetak penuh di Serial Monitor.
 5. Tekan tombol lagi untuk bertanya hal lain.
 
-## Tanya/baca jawaban panjang lewat HP (opsional, via Home Assistant)
+## Tanya/baca jawaban panjang lewat HP (opsional, via Home Assistant + Firebase)
 
 Layar OLED kecil (128x64) cuma muat ~6 baris teks. Kalau mau tanya/baca
 panjang tanpa batas itu, ada jalur opsional lewat **app Home Assistant
-Companion** di HP — tidak perlu bikin app Android sendiri:
+Companion** di HP — tidak perlu bikin app Android sendiri, dan **HA tidak
+perlu bisa diakses dari internet** (tidak perlu tunnel/Nabu Casa/port-forward
+sama sekali).
 
-1. **Home Assistant harus bisa diakses dari internet** (bukan cuma WiFi
-   rumah), karena ESP32 cuma bisa akses keluar (outbound), tidak bisa
-   dihubungi dari jaringan lokal. Pakai Nabu Casa, reverse proxy sendiri,
-   atau untuk testing: `~/bin/cloudflared tunnel --url http://localhost:8123`
-   (gratis, tapi URL-nya sementara & berubah tiap dijalankan ulang).
-2. Buat 1 helper teks di HA (sekali saja): Settings → Devices & Services →
-   tab **Helpers** → **+ Create Helper** → **Text** → Name: `pocket ai
-   question` → Create. (Max length 255 karakter — ini batas keras bawaan HA,
-   tidak bisa dinaikkan.)
-3. Generate **Long-Lived Access Token**: klik foto profil → Security →
-   Long-Lived Access Tokens → Create Token.
-4. Isi `HA_URL` dan `HA_TOKEN` di `src/secrets.h` (lihat `secrets.h.example`).
+**Kenapa lewat Firebase, bukan ESP32 connect langsung ke HA?** Supaya kedua
+sisi (ESP32 *dan* HA) cuma perlu koneksi **keluar** (outbound) ke Firebase
+Realtime Database — URL-nya permanen, tidak pernah berubah walau HA/Docker
+di-restart berkali-kali. Alurnya:
 
-Cara pakai: ketik pertanyaan di helper `pocket ai question` lewat dashboard
-app HA Companion di HP → ESP32 mendeteksinya (cek tiap ~4 detik saat tidak
-sibuk) → jawaban lengkap Nemotron dikirim balik sebagai **notifikasi** ke
-app HA Companion-mu, bisa dibaca penuh tanpa batas panjang OLED. Pertanyaan
-lewat tombol+Serial juga tetap mengirim notifikasi yang sama ke HP, jadi
-kamu selalu punya salinan jawaban lengkap di HP.
+```
+[HP] ketik di helper HA  →  HA (automation, outbound) → tulis ke Firebase
+                                                              ↓
+                                  ESP32 (outbound) polling Firebase tiap ~4 detik
+                                                              ↓
+                                                   panggil NVIDIA Nemotron
+                                                              ↓
+                                            ESP32 tulis jawaban ke Firebase (outbound)
+                                                              ↓
+                       HA (automation, outbound, polling tiap 5 detik) baca → notifikasi ke HP
+```
 
-Kosongkan `HA_URL` (`""`) di `secrets.h` untuk mematikan fitur ini — firmware
-tetap jalan normal lewat tombol+Serial+OLED saja.
+### Setup (sekali saja)
+
+1. **Buat project Firebase** (gratis) di https://console.firebase.google.com,
+   lalu aktifkan **Realtime Database** (pilih lokasi terdekat, mode "locked"/
+   secure default).
+2. **Set Security Rules**-nya supaya HANYA 1 path rahasia yang publik
+   (read+write), path lain tetap terkunci. Generate path acak panjang dulu:
+   ```bash
+   echo "pocket_ai_$(openssl rand -hex 16)"
+   ```
+   Lalu di Firebase Console → Realtime Database → Rules, isi (ganti
+   `PATH_ACAK_KAMU` dengan hasil di atas):
+   ```json
+   {
+     "rules": {
+       "PATH_ACAK_KAMU": {
+         ".read": true,
+         ".write": true
+       }
+     }
+   }
+   ```
+   ⚠️ **Trade-off keamanan**: siapa pun yang tahu path acak ini bisa
+   baca/tulis ke situ (tanpa login). Cukup aman untuk data Q&A yang tidak
+   sensitif (bukan untuk data pribadi/finansial), karena path-nya praktis
+   tidak bisa ditebak. Path lain di database tetap tertutup penuh.
+3. Isi `FIREBASE_DB_URL` dan `FIREBASE_SECRET_PATH` di `src/secrets.h`
+   (lihat `secrets.h.example`).
+4. **Di Home Assistant**, buat 1 helper teks (Settings → Devices & Services
+   → tab **Helpers** → **+ Create Helper** → **Text** → Name: `pocket ai
+   question`), lalu tambahkan ke `configuration.yaml`:
+   ```yaml
+   rest_command:
+     pocket_ai_push_question:
+       url: "https://<DB_URL>/<PATH_ACAK_KAMU>/question.json"
+       method: put
+       payload: '"{{ states("input_text.pocket_ai_question") | replace("\"", "") }}"'
+       content_type: "application/json"
+     pocket_ai_clear_answer:
+       url: "https://<DB_URL>/<PATH_ACAK_KAMU>/answer.json"
+       method: put
+       payload: "null"
+       content_type: "application/json"
+
+   sensor:
+     - platform: rest
+       name: pocket_ai_answer
+       resource: "https://<DB_URL>/<PATH_ACAK_KAMU>/answer.json"
+       value_template: "{{ value_json }}"
+       scan_interval: 5
+   ```
+   Dan ke `automations.yaml`:
+   ```yaml
+   - alias: "Pocket AI - kirim pertanyaan ke Firebase"
+     trigger:
+       - platform: state
+         entity_id: input_text.pocket_ai_question
+     condition:
+       - condition: template
+         value_template: "{{ trigger.to_state.state not in ['', 'unknown', 'unavailable'] }}"
+     action:
+       - service: rest_command.pocket_ai_push_question
+       - delay: "00:00:01"
+       - service: input_text.set_value
+         target: { entity_id: input_text.pocket_ai_question }
+         data: { value: "" }
+
+   - alias: "Pocket AI - notifikasi jawaban dari Firebase"
+     trigger:
+       - platform: state
+         entity_id: sensor.pocket_ai_answer
+     condition:
+       - condition: template
+         value_template: "{{ trigger.to_state.state not in ['', 'unknown', 'unavailable', 'None'] }}"
+     action:
+       - service: persistent_notification.create
+         data:
+           title: "Pocket AI"
+           message: "{{ trigger.to_state.state }}"
+           notification_id: "pocket_ai_answer"
+       - service: rest_command.pocket_ai_clear_answer
+   ```
+5. Restart HA supaya `rest_command` & sensor baru kepakai.
+
+### Cara pakai
+
+Ketik pertanyaan di helper `pocket ai question` lewat dashboard app HA
+Companion di HP (Settings → Devices & Services → Helpers → tap helper-nya) →
+ESP32 mendeteksinya lewat Firebase (cek tiap ~4 detik saat tidak sibuk) →
+jawaban lengkap Nemotron dikirim balik lewat Firebase → HA mendeteksinya
+(cek tiap 5 detik) → muncul sebagai **notifikasi** di app HA Companion,
+bisa dibaca penuh tanpa batas panjang OLED. Pertanyaan lewat tombol+Serial
+juga tetap mengirim notifikasi yang sama ke HP.
+
+Kosongkan `FIREBASE_DB_URL` (`""`) di `secrets.h` untuk mematikan fitur ini
+— firmware tetap jalan normal lewat tombol+Serial+OLED saja.
 
 ## Catatan teknis
 

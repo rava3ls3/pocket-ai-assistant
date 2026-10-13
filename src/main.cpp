@@ -325,20 +325,36 @@ void enterListening() {
 }
 
 // ---------------------------------------------------------
-// Integrasi opsional dengan Home Assistant, supaya pertanyaan panjang bisa
-// diketik dan jawabannya dibaca penuh lewat app HA Companion di HP (tidak
-// dibatasi layar OLED 128x64). Jalur komunikasinya murni outbound HTTPS dari
-// ESP32 ke HA (REST API), bukan ESPHome native API -- karena native API
-// butuh HA yang connect ke device, yang tidak bisa menembus jaringan
-// simulasi Wokwi. Semua fungsi ini no-op kalau HA_URL belum diisi di
-// secrets.h (lihat secrets.h.example).
+// Integrasi opsional dengan Home Assistant (lewat Firebase Realtime
+// Database sebagai jembatan), supaya pertanyaan panjang bisa diketik dan
+// jawabannya dibaca penuh lewat app HA Companion di HP (tidak dibatasi
+// layar OLED 128x64).
+//
+// ESP32 TIDAK connect langsung ke HA -- HA tidak perlu bisa diakses dari
+// internet sama sekali. Sebagai gantinya:
+//   - ESP32 polling Firebase RTDB (URL permanen, tidak pernah berubah)
+//   - HA punya automation (lihat README) yang menulis pertanyaan dari HP ke
+//     Firebase, dan membaca jawaban dari Firebase untuk dikirim sebagai
+//     notifikasi ke app HA Companion
+// Keduanya (ESP32 & HA) cuma butuh koneksi KELUAR (outbound) ke Firebase,
+// jadi tidak perlu tunnel/port-forward ke HA lagi.
+//
+// Path Firebase-nya sendiri berperan sebagai "kunci" (string acak panjang
+// di FIREBASE_SECRET_PATH) -- security rules Firestore cuma mengizinkan
+// baca/tulis publik di path spesifik itu, path lain tetap terkunci. Semua
+// fungsi ini no-op kalau FIREBASE_DB_URL belum diisi di secrets.h.
 // ---------------------------------------------------------
 bool haConfigured() {
-  return strlen(HA_URL) > 0;
+  return strlen(FIREBASE_DB_URL) > 0;
 }
 
-// Ambil isi helper input_text.pocket_ai_question dari HA (hasil ketikan di
-// app HA Companion di HP). String kosong = tidak ada/gagal.
+String firebasePath(const String &key) {
+  return String(FIREBASE_DB_URL) + "/" + FIREBASE_SECRET_PATH + "/" + key + ".json";
+}
+
+// Ambil pertanyaan dari Firebase (hasil ketikan di app HA Companion di HP,
+// diteruskan HA ke Firebase lewat automation). String kosong = tidak
+// ada/gagal/null.
 String haGetQuestion() {
   if (!haConfigured()) return "";
 
@@ -347,15 +363,16 @@ String haGetQuestion() {
   HTTPClient https;
   String result;
 
-  String url = String(HA_URL) + "/api/states/input_text.pocket_ai_question";
-  if (https.begin(client, url)) {
-    https.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+  if (https.begin(client, firebasePath("question"))) {
     int code = https.GET();
     if (code == 200) {
-      JsonDocument doc;
-      if (!deserializeJson(doc, https.getString())) {
-        const char *s = doc["state"];
-        if (s) result = String(s);
+      String payload = https.getString();
+      payload.trim();
+      // Firebase RTDB kembalikan string JSON ber-quote (mis. "halo"), atau
+      // literal null kalau belum ada nilai.
+      if (payload != "null" && payload.length() >= 2 &&
+          payload.startsWith("\"") && payload.endsWith("\"")) {
+        result = payload.substring(1, payload.length() - 1);
       }
     }
     https.end();
@@ -363,7 +380,7 @@ String haGetQuestion() {
   return result;
 }
 
-// Kosongkan lagi helper-nya di HA setelah pertanyaannya diproses, supaya
+// Kosongkan lagi field "question" di Firebase setelah diproses, supaya
 // tidak terus-terusan ke-trigger ulang oleh nilai yang sama.
 void haClearQuestion() {
   if (!haConfigured()) return;
@@ -372,40 +389,31 @@ void haClearQuestion() {
   client.setInsecure();
   HTTPClient https;
 
-  String url = String(HA_URL) + "/api/services/input_text/set_value";
-  if (https.begin(client, url)) {
-    https.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+  if (https.begin(client, firebasePath("question"))) {
     https.addHeader("Content-Type", "application/json");
-    JsonDocument doc;
-    doc["entity_id"] = "input_text.pocket_ai_question";
-    doc["value"] = "";
-    String body;
-    serializeJson(doc, body);
-    https.POST(body);
+    https.PUT("null");
     https.end();
   }
 }
 
-// Kirim jawaban lengkap sebagai persistent_notification -> muncul di lonceng
-// notifikasi app HA Companion di HP, bisa dibaca penuh tanpa batas panjang.
+// Tulis jawaban lengkap ke Firebase -> automation di HA (polling tiap ~5
+// detik) mendeteksinya dan mengirim sebagai persistent_notification ke app
+// HA Companion di HP, bisa dibaca penuh tanpa batas panjang.
 void haNotify(const String &question, const String &answer) {
   if (!haConfigured()) return;
+  (void)question; // judul tidak disertakan di sisi Firebase; HA yang format pesan
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient https;
 
-  String url = String(HA_URL) + "/api/services/persistent_notification/create";
-  if (https.begin(client, url)) {
-    https.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+  if (https.begin(client, firebasePath("answer"))) {
     https.addHeader("Content-Type", "application/json");
     JsonDocument doc;
-    doc["title"] = "Pocket AI: " + question;
-    doc["message"] = answer;
-    doc["notification_id"] = "pocket_ai_answer";
+    doc.set(answer);
     String body;
     serializeJson(doc, body);
-    https.POST(body);
+    https.PUT(body);
     https.end();
   }
 }
