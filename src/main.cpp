@@ -129,11 +129,15 @@ void showScreen(const String &title, const String &body) {
   display.display();
 }
 
+// Ekspresi wajah robot yang bisa digambar
+enum RobotExpression { FACE_NEUTRAL, FACE_SAD };
+
 // ---------------------------------------------------------
-// Wajah robot sederhana untuk layar standby/idle (digambar pakai primitif
-// Adafruit_GFX, tanpa perlu file bitmap terpisah).
+// Wajah robot sederhana (digambar pakai primitif Adafruit_GFX, tanpa perlu
+// file bitmap terpisah). Dipakai untuk layar standby/idle (netral) dan
+// layar WiFi gagal (sedih).
 // ---------------------------------------------------------
-void drawRobotFace(const String &caption) {
+void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -141,22 +145,45 @@ void drawRobotFace(const String &caption) {
   const int headX = (SCREEN_WIDTH - headW) / 2;  // 36
   const int headY = 4;
 
-  // Antena
-  int antX = SCREEN_WIDTH / 2;
-  display.drawLine(antX, headY - 6, antX, headY, SSD1306_WHITE);
-  display.fillCircle(antX, headY - 8, 2, SSD1306_WHITE);
+  if (expr == FACE_NEUTRAL) {
+    // Antena tegak - ekspresi siap/netral
+    int antX = SCREEN_WIDTH / 2;
+    display.drawLine(antX, headY - 6, antX, headY, SSD1306_WHITE);
+    display.fillCircle(antX, headY - 8, 2, SSD1306_WHITE);
+  } else {
+    // Antena terkulai - ekspresi sedih/lesu
+    int antX = SCREEN_WIDTH / 2;
+    display.drawLine(antX, headY, antX - 5, headY - 6, SSD1306_WHITE);
+    display.fillCircle(antX - 5, headY - 6, 2, SSD1306_WHITE);
+  }
 
   // Kepala
   display.drawRoundRect(headX, headY, headW, headH, 8, SSD1306_WHITE);
 
-  // Mata (dua kotak membulat)
   int eyeY = headY + 14;
-  display.fillRoundRect(headX + 11, eyeY, 10, 14, 3, SSD1306_WHITE);
-  display.fillRoundRect(headX + headW - 21, eyeY, 10, 14, 3, SSD1306_WHITE);
+  if (expr == FACE_NEUTRAL) {
+    // Mata: dua kotak membulat
+    display.fillRoundRect(headX + 11, eyeY, 10, 14, 3, SSD1306_WHITE);
+    display.fillRoundRect(headX + headW - 21, eyeY, 10, 14, 3, SSD1306_WHITE);
+  } else {
+    // Mata sedih: "X" di tiap mata
+    int exL = headX + 11, exR = headX + headW - 21, ew = 10, eh = 14;
+    display.drawLine(exL, eyeY, exL + ew, eyeY + eh, SSD1306_WHITE);
+    display.drawLine(exL + ew, eyeY, exL, eyeY + eh, SSD1306_WHITE);
+    display.drawLine(exR, eyeY, exR + ew, eyeY + eh, SSD1306_WHITE);
+    display.drawLine(exR + ew, eyeY, exR, eyeY + eh, SSD1306_WHITE);
+  }
 
-  // Mulut: garis datar simpel (ekspresi "siap/netral")
   int mouthY = headY + headH - 10;
-  display.drawLine(headX + 16, mouthY, headX + headW - 16, mouthY, SSD1306_WHITE);
+  if (expr == FACE_NEUTRAL) {
+    // Mulut: garis datar simpel
+    display.drawLine(headX + 16, mouthY, headX + headW - 16, mouthY, SSD1306_WHITE);
+  } else {
+    // Mulut sedih: lengkungan terbalik (cemberut)
+    int mcx = headX + headW / 2;
+    display.drawLine(headX + 16, mouthY + 4, mcx, mouthY, SSD1306_WHITE);
+    display.drawLine(mcx, mouthY, headX + headW - 16, mouthY + 4, SSD1306_WHITE);
+  }
 
   // Caption singkat di bawah wajah
   display.setTextSize(1);
@@ -275,7 +302,7 @@ void connectWiFi() {
     drawRobotFace("Siap! Tekan tombol");
   } else {
     Serial.println("WiFi GAGAL tersambung.");
-    showScreen("Pocket AI", "WiFi gagal. Cek SSID\ndi secrets.h");
+    drawRobotFace("WiFi gagal :(", FACE_SAD);
   }
 }
 
