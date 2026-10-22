@@ -9,13 +9,16 @@
  * tombol di bawah).
  *
  * Tombol:
- *   - ASK (D0)  : tekan singkat = tanya ke AI. Tekan & tahan (>=1.2 detik)
- *                 dari layar standby = buka menu Pengaturan.
+ *   - ASK (D0)  : klik tunggal = tanya ke AI (atau "kembali" selama di
+ *                 dalam menu Pengaturan). Klik GANDA (2x tekan dalam
+ *                 <=1 detik) dari layar standby = buka menu Pengaturan;
+ *                 di dalam menu, pada item yang bisa diubah (Kecerahan/
+ *                 Volume/Timeout layar) = masuk mode edit nilai.
  *   - UP   (D1) : tampilkan jam. Di dalam menu Pengaturan: pindah ke item
- *                 berikutnya.
+ *                 berikutnya (LIST) atau naikkan nilai (mode edit).
  *   - DOWN (D3) : tampilkan jam juga (nanti: volume down kalau sudah ada
  *                 speaker asli). Di dalam menu Pengaturan: pindah ke item
- *                 sebelumnya.
+ *                 sebelumnya (LIST) atau turunkan nilai (mode edit).
  *
  * Deteksi tombol pakai HARDWARE INTERRUPT (attachInterrupt), bukan cuma
  * polling digitalRead() biasa -- supaya penekanan tombol tetap tertangkap
@@ -85,7 +88,7 @@ static const int     BODY_START_Y    = 12;
 // ---------- State machine ----------
 enum AssistantState {
   STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED,
-  STATE_CLOCK, STATE_SETTINGS
+  STATE_CLOCK, STATE_SETTINGS, STATE_SETTINGS_EDIT
 };
 AssistantState state = STATE_IDLE;
 
@@ -106,7 +109,7 @@ bool ledOn = false;
 // edge) seketika kapan pun terjadi, lepas dari apa yang sedang dikerjakan
 // loop() -- begitu loop() longgar lagi, flag-nya masih ada untuk diproses.
 // ---------------------------------------------------------
-static const unsigned long DEBOUNCE_MS = 40;
+static const unsigned long DEBOUNCE_MS = 60;
 
 volatile bool upIsrFlag = false;
 volatile bool downIsrFlag = false;
@@ -115,31 +118,45 @@ void IRAM_ATTR onUpFalling() { upIsrFlag = true; }
 void IRAM_ATTR onDownFalling() { downIsrFlag = true; }
 
 // ASK butuh DUA tepi (tekan + lepas), bukan cuma falling, karena ASK juga
-// melacak DURASI tekan (utk tekan-tahan masuk menu Pengaturan). Kalau cuma
-// falling edge yang ditangkap interrupt, durasi tekan tetap dihitung
-// dengan polling millis() dari loop() secara berkala -- rentan "tertelan"
-// sama panggilan blocking yang lama (mis. haGetQuestion() polling
-// Firebase saat idle), karena loop() tidak sempat mengecek ambang waktu
-// tekan-tahan sampai panggilan itu selesai. Dengan interrupt CHANGE
-// (falling DAN rising), timestamp AWAL dan AKHIR tekan sama-sama direkam
+// membedakan klik-tunggal vs klik-ganda (utk "enter" ke menu Pengaturan /
+// mode edit) berdasarkan jarak waktu antar klik. Kalau cuma falling edge
+// yang ditangkap interrupt, waktu SELESAI tiap klik (dipakai utk ukur
+// jarak ke klik berikutnya) tetap bergantung polling millis() dari loop()
+// secara berkala -- rentan "tertelan" sama panggilan blocking yang lama
+// (mis. haGetQuestion() polling Firebase saat idle), karena loop() tidak
+// sempat mencatat waktu rilis sampai panggilan itu selesai, bikin jarak
+// antar klik keukur salah/kelewat jauh. Dengan interrupt CHANGE (falling
+// DAN rising), timestamp tekan maupun rilis tiap klik sama-sama direkam
 // oleh hardware interrupt langsung saat kejadian -- begitu loop() longgar
-// lagi (walau telat), durasi tekan tetap bisa dihitung akurat dari dua
-// timestamp itu, bukan dari kapan loop() kebetulan sempat polling.
+// lagi (walau telat), jarak antar klik tetap terukur akurat dari
+// timestamp-timestamp itu, bukan dari kapan loop() kebetulan sempat
+// polling.
 volatile bool askFallingFlag = false;
 volatile unsigned long askFallingAt = 0;
 volatile bool askRisingFlag = false;
 volatile unsigned long askRisingAt = 0;
 volatile unsigned long askLastEventAt = 0;  // utk debounce tepi palsu langsung di ISR
+// Level pin yg kita lacak sendiri (bukan baca ulang digitalRead() di ISR):
+// pada transisi cepat (dua tepi berturut-turut dlm hitungan ms), sempat
+// kejadian digitalRead() di dalam ISR membaca nilai yg SUDAH berubah lagi
+// sebelum ISR utk tepi sebelumnya sempat selesai diproses -- hasilnya FALL
+// dan RISE bisa salah urutan/terbaca dobel. CHANGE interrupt sendiri selalu
+// benar2 berarti level terbalik dari sebelumnya, jadi toggle manual di sini
+// lebih bisa dipercaya drpd baca ulang pin tiap kali ISR jalan.
+volatile bool askPinIsLow = false;
 
 void IRAM_ATTR onAskChange() {
   unsigned long now = millis();
+  askPinIsLow = !askPinIsLow;  // CHANGE selalu berarti level benar2 terbalik
+
   // Debounce di level ISR: abaikan tepi yang muncul terlalu cepat setelah
-  // tepi sebelumnya (noise/bounce sesaat), supaya tidak merusak timestamp
-  // yang dipakai utk hitung durasi tekan (lihat updateAskButton()).
+  // tepi sebelumnya (noise/bounce sesaat) -- askPinIsLow tetap di-toggle di
+  // atas supaya klasifikasi tepi berikutnya tetap akurat, cuma event ini
+  // yang tidak dilaporkan ke firmware.
   if (now - askLastEventAt < DEBOUNCE_MS) return;
   askLastEventAt = now;
 
-  if (digitalRead(PIN_BTN_ASK) == LOW) {
+  if (askPinIsLow) {
     askFallingFlag = true;
     askFallingAt = now;
   } else {
@@ -180,55 +197,60 @@ bool checkEdge(SimpleButton &b) {
   return false;
 }
 
-// Tombol ASK butuh pembeda tekan-singkat vs tekan-tahan (>=LONG_PRESS_MS)
-// untuk masuk menu Pengaturan, jadi dapat penanganan state machine sendiri
-// (bukan cuma edge sederhana seperti UP/DOWN).
-static const unsigned long LONG_PRESS_MS = 1200;
-bool askButtonDown = false;      // status "ditekan" saat ini
-unsigned long askDownSince = 0;  // timestamp (dari ISR) saat mulai ditekan
-bool askLongFired = false;
+// Tombol ASK dibedakan klik-tunggal vs klik-ganda (bukan lagi tekan-tahan --
+// tekan-tahan ternyata terasa kurang nyaman dipakai). Klik-ganda = dua
+// tekan-lepas dalam jarak <=DOUBLE_CLICK_MS, dipakai sbg aksi "enter" (buka
+// menu Pengaturan / masuk mode edit item). Klik-tunggal tetap jadi aksi
+// default (tanya AI, atau "kembali" selama di dalam menu Pengaturan) --
+// tapi karena klik-tunggal baru bisa dipastikan BUKAN awal dari klik-ganda
+// setelah jendela DOUBLE_CLICK_MS lewat tanpa klik kedua, aksinya baru
+// benar-benar terpicu setelah jeda itu (maks ~1 detik keterlambatan).
+static const unsigned long DOUBLE_CLICK_MS = 1000;
+bool askButtonDown = false;        // status "ditekan" saat ini
+unsigned long askDownSince = 0;    // timestamp (dari ISR) saat mulai ditekan
+bool askClickPending = false;      // ada 1 klik yg masih nunggu potensi klik kedua
+unsigned long askPendingSince = 0; // kapan klik yg masih nunggu itu selesai (rilis)
 
-void updateAskButton(bool &shortPress, bool &longPress) {
-  shortPress = false;
-  longPress = false;
+void updateAskButton(bool &singleClick, bool &doubleClick) {
+  singleClick = false;
+  doubleClick = false;
 
   if (askFallingFlag) {
     askFallingFlag = false;
     if (!askButtonDown) {
       askButtonDown = true;
       askDownSince = askFallingAt;  // timestamp dari ISR, bukan millis() saat ini
-      askLongFired = false;
     }
+    return;  // jangan lanjut ke cek timeout klik-tunggal di pemanggilan yg sama
+             // (kalau tidak, timeout klik yg masih "pending" dari SEBELUMnya
+             // bisa salah tereksekusi tepat saat tekan BARU ini baru mulai)
   }
 
   if (askRisingFlag) {
     askRisingFlag = false;
     if (askButtonDown) {
       askButtonDown = false;
-      // Durasi dihitung dari DUA timestamp yang direkam interrupt (tekan &
-      // lepas), bukan dari kapan loop() ini kebetulan sempat jalan -- jadi
-      // tetap akurat walau loop() tadi blocking lama persis selama tombol
-      // ditahan (lihat komentar panjang di atas onAskChange()).
-      unsigned long heldMs = askRisingAt - askDownSince;
-      if (!askLongFired) {
-        if (heldMs >= LONG_PRESS_MS) {
-          askLongFired = true;
-          longPress = true;
-        } else {
-          shortPress = true;
-        }
+      if (askClickPending &&
+          askRisingAt - askPendingSince <= DOUBLE_CLICK_MS) {
+        // Klik kedua datang dalam jendela -> klik-ganda.
+        askClickPending = false;
+        doubleClick = true;
+      } else {
+        // Klik pertama (atau klik sendirian) -- tunggu dulu, jangan
+        // langsung dianggap klik-tunggal, siapa tahu ada klik kedua nyusul.
+        askClickPending = true;
+        askPendingSince = askRisingAt;
       }
     }
-    return;  // sudah pasti tuntas (tekan+lepas); tidak perlu cek "masih ditahan" di bawah
+    return;
   }
 
-  // Belum ada event rilis -- kalau masih ditekan, cek ambang tekan-tahan
-  // pakai waktu SEKARANG, supaya bisa langsung bereaksi begitu loop()
-  // longgar lagi tanpa perlu menunggu tombol dilepas dulu.
-  if (askButtonDown && !askLongFired &&
-      millis() - askDownSince >= LONG_PRESS_MS) {
-    askLongFired = true;
-    longPress = true;
+  // Tidak ada tekan/rilis baru -- kalau ada klik yg masih "nunggu" dan
+  // jendela klik-ganda sudah lewat tanpa klik kedua, baru itu dipastikan
+  // klik-tunggal.
+  if (askClickPending && millis() - askPendingSince > DOUBLE_CLICK_MS) {
+    askClickPending = false;
+    singleClick = true;
   }
 }
 
@@ -553,10 +575,17 @@ void enterClock() {
 }
 
 // ---------------------------------------------------------
-// Menu Pengaturan -- dibuka dengan tekan-tahan tombol ASK (>=1.2 detik)
-// dari layar standby. UP/DOWN pindah antar item, tekan-singkat ASK
-// mengubah nilai item yang bisa diubah, tekan-tahan ASK lagi (atau idle
-// 15 detik) keluar & menyimpan ke NVS.
+// Menu Pengaturan -- navigasi dua level:
+//   - LIST (STATE_SETTINGS): UP/DOWN pindah antar 6 item. Klik-ganda ASK
+//     (<=1 detik) pada item yang bisa diubah (Kecerahan/Volume/Timeout
+//     layar) masuk ke mode EDIT; pada item read-only (WiFi/Baterai/
+//     Firmware) klik-ganda tidak ngapa-ngapain. Klik-tunggal ASK keluar
+//     menu, balik ke standby.
+//   - EDIT (STATE_SETTINGS_EDIT): UP/DOWN mengubah nilai item yang sedang
+//     aktif. Klik-tunggal ASK kembali ke LIST (nilai sudah otomatis
+//     kepakai & tersimpan).
+// Dibuka dari standby/jawaban dengan klik-ganda ASK. Idle 15 detik di
+// LIST maupun EDIT otomatis keluar & menyimpan ke NVS.
 // ---------------------------------------------------------
 enum SettingItem {
   SET_BRIGHTNESS, SET_VOLUME, SET_WIFI, SET_TIMEOUT, SET_BATTERY, SET_FIRMWARE,
@@ -566,13 +595,18 @@ int settingIndex = 0;
 unsigned long settingsLastActivity = 0;
 static const unsigned long SETTINGS_IDLE_TIMEOUT_MS = 15000;
 
-void drawSettingsScreen() {
+bool settingItemIsAdjustable(int idx) {
+  return idx == SET_BRIGHTNESS || idx == SET_VOLUME || idx == SET_TIMEOUT;
+}
+
+void drawSettingsScreen(bool editing) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
   display.setCursor(0, 0);
-  display.println("Setting " + String(settingIndex + 1) + "/" + String((int)SET_COUNT));
+  display.println((editing ? "Edit " : "Setting ") + String(settingIndex + 1) +
+                   "/" + String((int)SET_COUNT));
   display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
 
   display.setCursor(0, 12);
@@ -621,9 +655,6 @@ void drawSettingsScreen() {
       break;
   }
 
-  display.setCursor(0, SCREEN_HEIGHT - 8);
-  display.println("Up/Dwn:pilih Ask:ubah");
-
   display.display();
 }
 
@@ -631,7 +662,7 @@ void enterSettings() {
   state = STATE_SETTINGS;
   settingIndex = 0;
   settingsLastActivity = millis();
-  drawSettingsScreen();
+  drawSettingsScreen(false);
 }
 
 void exitSettings() {
@@ -640,6 +671,19 @@ void exitSettings() {
   lastActivityAt = millis();
   drawRobotFace("Siap! Tekan tombol");
   scheduleIdleAnim();
+}
+
+void enterSettingsEdit() {
+  state = STATE_SETTINGS_EDIT;
+  settingsLastActivity = millis();
+  drawSettingsScreen(true);
+}
+
+void exitSettingsEdit() {
+  saveSettings();
+  state = STATE_SETTINGS;
+  settingsLastActivity = millis();
+  drawSettingsScreen(false);
 }
 
 // ---------------------------------------------------------
@@ -837,9 +881,9 @@ String firebasePath(const String &key) {
 // lewat client.setHandshakeTimeout() (bukan https.setTimeout()/
 // setConnectTimeout() yang cuma membatasi fase TCP connect & baca data) --
 // tanpa ini, handshake yang macet bisa membuat panggilan ini blocking jauh
-// lebih lama dari 3 detik yang dimaksud (terbukti langsung: tombol ASK
-// tekan-tahan bisa tidak terdeteksi sama sekali kalau ini kejadian persis
-// selama tombol ditahan).
+// lebih lama dari 3 detik yang dimaksud (terbukti langsung: deteksi klik
+// tombol ASK bisa telat/meleset kalau ini kejadian persis di tengah jarak
+// antar klik yang sedang diukur).
 String haGetQuestion() {
   if (!haConfigured()) return "";
 
@@ -976,56 +1020,70 @@ void setup() {
 }
 
 void loop() {
-  // --- Baca tombol ASK (short vs long press) dan UP/DOWN (edge biasa) ---
-  bool askShort, askLong;
-  updateAskButton(askShort, askLong);
+  // --- Baca tombol ASK (klik-tunggal vs klik-ganda) dan UP/DOWN (edge biasa) ---
+  bool askSingle, askDouble;
+  updateAskButton(askSingle, askDouble);
   bool upPressed = checkEdge(btnUp);
   bool downPressed = checkEdge(btnDown);
 
-  if (askShort || askLong || upPressed || downPressed) {
+  if (askSingle || askDouble || upPressed || downPressed) {
     wakeScreen();  // tombol apa pun membangunkan layar kalau sempat mati (timeout)
   }
-  // --- Tekan-tahan ASK dari standby/jawaban = buka menu Pengaturan ---
-  if (askLong && (state == STATE_IDLE || state == STATE_ANSWERED)) {
+  // --- Klik-ganda ASK dari standby/jawaban = buka menu Pengaturan ---
+  if (askDouble && (state == STATE_IDLE || state == STATE_ANSWERED)) {
     enterSettings();
   }
-  // Tekan-tahan ASK lagi SAAT di menu Pengaturan = keluar & simpan.
-  else if (askLong && state == STATE_SETTINGS) {
-    exitSettings();
+  // Klik-ganda ASK di LIST, pada item yang bisa diubah = masuk mode edit.
+  else if (askDouble && state == STATE_SETTINGS) {
+    if (settingItemIsAdjustable(settingIndex)) {
+      enterSettingsEdit();
+    }
+    // item read-only (WiFi/Baterai/Firmware): klik-ganda tidak ngapa-ngapain
   }
-  // Tekan-singkat ASK: mulai tanya (dari IDLE/ANSWERED/CLOCK -- menekan ASK
+  // Klik-tunggal ASK: mulai tanya (dari IDLE/ANSWERED/CLOCK -- menekan ASK
   // saat lagi lihat jam langsung membatalkan jam & mulai tanya).
-  else if (askShort &&
+  else if (askSingle &&
            (state == STATE_IDLE || state == STATE_ANSWERED || state == STATE_CLOCK)) {
     enterListening();
   }
-  // Tekan-singkat ASK di dalam menu Pengaturan: ubah/cycle nilai item aktif.
-  else if (askShort && state == STATE_SETTINGS) {
-    switch (settingIndex) {
-      case SET_BRIGHTNESS:
-        settings.brightness = (settings.brightness + 1) % 3;
-        applyBrightness();
-        break;
-      case SET_VOLUME:
-        settings.volume = (settings.volume + 1) % 5;
-        break;
-      case SET_TIMEOUT:
-        settings.screenTimeout = (settings.screenTimeout + 1) % 4;
-        break;
-      default:
-        break;  // item read-only (WiFi/Baterai/Firmware): tekan ASK tidak ngapa-ngapain
-    }
-    settingsLastActivity = millis();
-    drawSettingsScreen();
+  // Klik-tunggal ASK di LIST Pengaturan = keluar, balik ke standby.
+  else if (askSingle && state == STATE_SETTINGS) {
+    exitSettings();
+  }
+  // Klik-tunggal ASK di mode EDIT = kembali ke LIST (nilai sudah tersimpan).
+  else if (askSingle && state == STATE_SETTINGS_EDIT) {
+    exitSettingsEdit();
   }
 
   // --- Tombol UP/DOWN ---
   if (upPressed || downPressed) {
     if (state == STATE_SETTINGS) {
+      // Navigasi antar item di LIST.
       settingIndex = upPressed ? (settingIndex + 1) % SET_COUNT
                                 : (settingIndex - 1 + SET_COUNT) % SET_COUNT;
       settingsLastActivity = millis();
-      drawSettingsScreen();
+      drawSettingsScreen(false);
+    } else if (state == STATE_SETTINGS_EDIT) {
+      // Ubah nilai item yang sedang di-edit.
+      switch (settingIndex) {
+        case SET_BRIGHTNESS:
+          settings.brightness = upPressed ? (settings.brightness + 1) % 3
+                                           : (settings.brightness + 2) % 3;
+          applyBrightness();
+          break;
+        case SET_VOLUME:
+          settings.volume = upPressed ? (settings.volume + 1) % 5
+                                       : (settings.volume + 4) % 5;
+          break;
+        case SET_TIMEOUT:
+          settings.screenTimeout = upPressed ? (settings.screenTimeout + 1) % 4
+                                              : (settings.screenTimeout + 3) % 4;
+          break;
+        default:
+          break;  // seharusnya tidak pernah masuk EDIT utk item read-only
+      }
+      settingsLastActivity = millis();
+      drawSettingsScreen(true);
     } else if (state == STATE_IDLE || state == STATE_ANSWERED) {
       enterClock();
     } else if (state == STATE_CLOCK) {
@@ -1108,8 +1166,11 @@ void loop() {
   }
 
   // --- Menu Pengaturan: auto-keluar & simpan kalau idle terlalu lama ---
-  if (state == STATE_SETTINGS &&
-      millis() - settingsLastActivity > SETTINGS_IDLE_TIMEOUT_MS) {
-    exitSettings();
+  if (millis() - settingsLastActivity > SETTINGS_IDLE_TIMEOUT_MS) {
+    if (state == STATE_SETTINGS) {
+      exitSettings();
+    } else if (state == STATE_SETTINGS_EDIT) {
+      exitSettingsEdit();
+    }
   }
 }

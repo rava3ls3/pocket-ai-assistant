@@ -21,17 +21,23 @@ device saku (form factor ~21x17.8mm), dan punya cukup pin bebas untuk 3
 tombol fisik (ASK, UP, DOWN) tanpa sesak.
 
 **3 tombol:**
-| Tombol | Pin | Tekan singkat | Tekan & tahan (≥1.2 detik) | Fungsi nanti (hardware asli + speaker) |
+| Tombol | Pin | Klik tunggal | Klik GANDA (2x tekan dalam ≤1 detik) | Fungsi nanti (hardware asli + speaker) |
 |---|---|---|---|---|
-| ASK | D0 | Push-to-talk, mulai tanya ke AI | Buka/tutup menu **Pengaturan** (dari standby/jawaban) | Sama |
-| UP | D1 | Tampilkan jam (NTP) / pindah item berikutnya di menu Pengaturan | — | Volume up |
-| DOWN | D3 | Tampilkan jam (NTP) / pindah item sebelumnya di menu Pengaturan | — | Volume down |
+| ASK | D0 | Push-to-talk (mulai tanya ke AI), atau "kembali" selama di dalam menu Pengaturan | Buka menu **Pengaturan** (dari standby/jawaban), atau masuk mode edit nilai item | Sama |
+| UP | D1 | Tampilkan jam (NTP) / pindah item berikutnya (list) / naikkan nilai (mode edit) | — | Volume up |
+| DOWN | D3 | Tampilkan jam (NTP) / pindah item sebelumnya (list) / turunkan nilai (mode edit) | — | Volume down |
 
 Tekan ASK kapan saja (termasuk saat sedang lihat jam) untuk langsung mulai
 tanya. Tekan UP/DOWN untuk lihat jam — otomatis balik ke wajah robot standby
-setelah 5 detik tanpa tombol ditekan lagi. Tekan & tahan ASK dari layar
-standby atau jawaban untuk membuka menu **Pengaturan** (lihat bagian
-terpisah di bawah).
+setelah 5 detik tanpa tombol ditekan lagi. Klik ASK dua kali cepat (≤1 detik
+antar klik) dari layar standby/jawaban untuk membuka menu **Pengaturan**
+(lihat bagian terpisah di bawah).
+
+> Karena klik tunggal dan klik ganda sama-sama dimulai dengan menekan ASK,
+> firmware perlu menunggu sampai ~1 detik setelah tiap klik tunggal untuk
+> memastikan tidak ada klik kedua menyusul sebelum benar-benar memprosesnya
+> (standar untuk deteksi klik-ganda). Jadi aksi ASK klik-tunggal (mulai
+> tanya / kembali) terasa delay sepersekian detik — ini disengaja, bukan bug.
 
 **Kenapa diganti?** Wokwi belum punya simulasi audio I2S yang nyata — tidak bisa
 merekam suara asli dari mic atau memutar suara dari speaker virtual. Supaya kamu
@@ -97,14 +103,24 @@ gambar/bitmap terpisah):
 
 ## Menu Pengaturan
 
-Tekan & tahan tombol **ASK** (≥1.2 detik) dari layar standby atau layar
-jawaban untuk membuka menu Pengaturan. Di dalam menu:
+Klik tombol **ASK** dua kali cepat (≤1 detik antar klik) dari layar standby
+atau layar jawaban untuk membuka menu Pengaturan — navigasinya dua tingkat:
 
+**Tingkat LIST** (daftar 6 item):
 - **UP / DOWN** → pindah ke item berikutnya/sebelumnya
-- **ASK (tekan singkat)** → ubah/cycle nilai item yang sedang aktif
-- **ASK (tekan & tahan lagi)** → keluar dari menu & simpan ke memori
-  (bertahan walau direstart/dimatikan)
-- Otomatis keluar & simpan juga kalau tidak ada tombol ditekan selama 15 detik
+- **ASK (klik ganda)** → masuk mode edit item yang sedang dipilih (hanya
+  untuk item yang bisa diubah: Kecerahan/Volume/Timeout layar — klik ganda
+  di item info-saja seperti WiFi tidak ngapa-ngapain)
+- **ASK (klik tunggal)** → keluar dari menu, balik ke standby
+
+**Tingkat EDIT** (sedang mengubah nilai 1 item, header layar berubah jadi
+"Edit X/6"):
+- **UP / DOWN** → naikkan/turunkan nilai item
+- **ASK (klik tunggal)** → kembali ke tingkat LIST (nilai sudah otomatis
+  tersimpan)
+
+Di kedua tingkat, otomatis keluar & simpan ke NVS kalau tidak ada tombol
+ditekan selama 15 detik.
 
 6 item yang bisa dilihat/diatur:
 | Item | Bisa diubah? | Keterangan |
@@ -352,6 +368,14 @@ sebelum deploy.
   lagi sibuk network call). Interrupt menangkap tepi tekanan tombol
   seketika kapan pun terjadi, lepas dari apa yang sedang dikerjakan
   `loop()`, jadi tekanan tombol tidak pernah hilang lagi.
+- **Navigasi menu Pengaturan awalnya pakai tekan-tahan ASK**, tapi diganti
+  ke klik-ganda (2x klik ≤1 detik) karena tekan-tahan terasa kurang nyaman
+  dipakai. Tombol ASK pakai interrupt `CHANGE` (bukan cuma `FALLING`)
+  supaya timestamp tekan MAUPUN lepas tiap klik sama-sama direkam hardware
+  -- dipakai utk mengukur jarak antar klik secara akurat walau `loop()`
+  sempat blocking. Konsekuensinya: aksi klik-tunggal (tanya AI / kembali)
+  baru diproses ~1 detik setelah dilepas (menunggu memastikan tidak ada
+  klik kedua menyusul) -- ini standar utk deteksi klik-ganda, bukan bug.
 - Pin mapping XIAO ESP32-S3 (lihat `diagram.json` + komentar di
   `src/main.cpp`): I2C OLED di D4/GPIO5 (SDA) & D5/GPIO6 (SCL), tombol ASK
   di D0/GPIO1, UP di D1/GPIO2, DOWN di D3/GPIO4, LED status di D8/GPIO7.
