@@ -370,12 +370,19 @@ sebelum deploy.
   `loop()`, jadi tekanan tombol tidak pernah hilang lagi.
 - **Navigasi menu Pengaturan awalnya pakai tekan-tahan ASK**, tapi diganti
   ke klik-ganda (2x klik ≤1 detik) karena tekan-tahan terasa kurang nyaman
-  dipakai. Tombol ASK pakai interrupt `CHANGE` (bukan cuma `FALLING`)
-  supaya timestamp tekan MAUPUN lepas tiap klik sama-sama direkam hardware
-  -- dipakai utk mengukur jarak antar klik secara akurat walau `loop()`
-  sempat blocking. Konsekuensinya: aksi klik-tunggal (tanya AI / kembali)
-  baru diproses ~1 detik setelah dilepas (menunggu memastikan tidak ada
-  klik kedua menyusul) -- ini standar utk deteksi klik-ganda, bukan bug.
+  dipakai. Deteksi klik-ganda-nya pakai **polling + debounce biasa** di
+  `loop()` (pola sama persis seperti UP/DOWN), BUKAN baca timestamp di
+  dalam interrupt — percobaan awal pakai interrupt `CHANGE` (baca/
+  klasifikasi tepi tekan-lepas langsung di ISR) ternyata rentan meleset
+  kalau dua transisi kejadian berdekatan, yang justru PALING SERING
+  terjadi tepat saat klik-ganda asli (apalagi gesture double-click mouse
+  yang sangat cepat, jauh lebih cepat & "berisik" sinyalnya drpd simulasi
+  tekan-lepas yang diberi jeda manual). Interrupt falling-only tetap
+  dipakai (pola sama kayak UP/DOWN), tapi cuma sbg jaring pengaman "jangan
+  sampai kelewat kalau `loop()` lagi blocking" — bukan sumber timestamp.
+  Konsekuensinya: aksi klik-tunggal (tanya AI / kembali) baru diproses ~1
+  detik setelah dilepas (menunggu memastikan tidak ada klik kedua
+  menyusul) -- ini standar utk deteksi klik-ganda, bukan bug.
 - Pin mapping XIAO ESP32-S3 (lihat `diagram.json` + komentar di
   `src/main.cpp`): I2C OLED di D4/GPIO5 (SDA) & D5/GPIO6 (SCL), tombol ASK
   di D0/GPIO1, UP di D1/GPIO2, DOWN di D3/GPIO4, LED status di D8/GPIO7.

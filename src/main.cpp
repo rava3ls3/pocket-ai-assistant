@@ -113,57 +113,11 @@ static const unsigned long DEBOUNCE_MS = 60;
 
 volatile bool upIsrFlag = false;
 volatile bool downIsrFlag = false;
+volatile bool askIsrFlag = false;
 
 void IRAM_ATTR onUpFalling() { upIsrFlag = true; }
 void IRAM_ATTR onDownFalling() { downIsrFlag = true; }
-
-// ASK butuh DUA tepi (tekan + lepas), bukan cuma falling, karena ASK juga
-// membedakan klik-tunggal vs klik-ganda (utk "enter" ke menu Pengaturan /
-// mode edit) berdasarkan jarak waktu antar klik. Kalau cuma falling edge
-// yang ditangkap interrupt, waktu SELESAI tiap klik (dipakai utk ukur
-// jarak ke klik berikutnya) tetap bergantung polling millis() dari loop()
-// secara berkala -- rentan "tertelan" sama panggilan blocking yang lama
-// (mis. haGetQuestion() polling Firebase saat idle), karena loop() tidak
-// sempat mencatat waktu rilis sampai panggilan itu selesai, bikin jarak
-// antar klik keukur salah/kelewat jauh. Dengan interrupt CHANGE (falling
-// DAN rising), timestamp tekan maupun rilis tiap klik sama-sama direkam
-// oleh hardware interrupt langsung saat kejadian -- begitu loop() longgar
-// lagi (walau telat), jarak antar klik tetap terukur akurat dari
-// timestamp-timestamp itu, bukan dari kapan loop() kebetulan sempat
-// polling.
-volatile bool askFallingFlag = false;
-volatile unsigned long askFallingAt = 0;
-volatile bool askRisingFlag = false;
-volatile unsigned long askRisingAt = 0;
-volatile unsigned long askLastEventAt = 0;  // utk debounce tepi palsu langsung di ISR
-// Level pin yg kita lacak sendiri (bukan baca ulang digitalRead() di ISR):
-// pada transisi cepat (dua tepi berturut-turut dlm hitungan ms), sempat
-// kejadian digitalRead() di dalam ISR membaca nilai yg SUDAH berubah lagi
-// sebelum ISR utk tepi sebelumnya sempat selesai diproses -- hasilnya FALL
-// dan RISE bisa salah urutan/terbaca dobel. CHANGE interrupt sendiri selalu
-// benar2 berarti level terbalik dari sebelumnya, jadi toggle manual di sini
-// lebih bisa dipercaya drpd baca ulang pin tiap kali ISR jalan.
-volatile bool askPinIsLow = false;
-
-void IRAM_ATTR onAskChange() {
-  unsigned long now = millis();
-  askPinIsLow = !askPinIsLow;  // CHANGE selalu berarti level benar2 terbalik
-
-  // Debounce di level ISR: abaikan tepi yang muncul terlalu cepat setelah
-  // tepi sebelumnya (noise/bounce sesaat) -- askPinIsLow tetap di-toggle di
-  // atas supaya klasifikasi tepi berikutnya tetap akurat, cuma event ini
-  // yang tidak dilaporkan ke firmware.
-  if (now - askLastEventAt < DEBOUNCE_MS) return;
-  askLastEventAt = now;
-
-  if (askPinIsLow) {
-    askFallingFlag = true;
-    askFallingAt = now;
-  } else {
-    askRisingFlag = true;
-    askRisingAt = now;
-  }
-}
+void IRAM_ATTR onAskFalling() { askIsrFlag = true; }
 
 struct SimpleButton {
   int pin;
@@ -205,9 +159,21 @@ bool checkEdge(SimpleButton &b) {
 // tapi karena klik-tunggal baru bisa dipastikan BUKAN awal dari klik-ganda
 // setelah jendela DOUBLE_CLICK_MS lewat tanpa klik kedua, aksinya baru
 // benar-benar terpicu setelah jeda itu (maks ~1 detik keterlambatan).
+//
+// PENTING -- status tekan/rilis dilacak lewat POLLING + debounce biasa
+// (persis pola checkEdge() di atas), BUKAN lewat timestamp yang dibaca di
+// dalam ISR. Percobaan sebelumnya (pakai interrupt CHANGE + baca/klasifikasi
+// tepi di dalam ISR) ternyata rentan meleset kalau dua transisi terjadi
+// berdekatan (umum terjadi persis saat klik-ganda, apalagi gesture
+// double-click mouse yang asli di Wokwi GUI -- jauh lebih cepat & lebih
+// "berisik" sinyalnya daripada rangkaian set-control yang diberi jeda
+// manual). Dengan polling+debounce di sini, digitalRead() selalu dibaca
+// dari konteks loop() biasa (tidak racy), dan isrFlag (falling-only, sama
+// seperti UP/DOWN) cuma dipakai sbg jaring pengaman kalau SELURUH
+// tekan-lepas kejadian persis di tengah panggilan blocking.
 static const unsigned long DOUBLE_CLICK_MS = 1000;
-bool askButtonDown = false;        // status "ditekan" saat ini
-unsigned long askDownSince = 0;    // timestamp (dari ISR) saat mulai ditekan
+bool askButtonDown = false;        // status "ditekan" (debounced) saat ini
+unsigned long askLastChangeTime = 0;  // kapan status debounced terakhir berubah
 bool askClickPending = false;      // ada 1 klik yg masih nunggu potensi klik kedua
 unsigned long askPendingSince = 0; // kapan klik yg masih nunggu itu selesai (rilis)
 
@@ -215,23 +181,27 @@ void updateAskButton(bool &singleClick, bool &doubleClick) {
   singleClick = false;
   doubleClick = false;
 
-  if (askFallingFlag) {
-    askFallingFlag = false;
-    if (!askButtonDown) {
-      askButtonDown = true;
-      askDownSince = askFallingAt;  // timestamp dari ISR, bukan millis() saat ini
-    }
-    return;  // jangan lanjut ke cek timeout klik-tunggal di pemanggilan yg sama
-             // (kalau tidak, timeout klik yg masih "pending" dari SEBELUMnya
-             // bisa salah tereksekusi tepat saat tekan BARU ini baru mulai)
-  }
+  bool raw = (digitalRead(PIN_BTN_ASK) == LOW);
+  bool isrCaught = askIsrFlag;
+  if (isrCaught) askIsrFlag = false;
+  unsigned long now = millis();
 
-  if (askRisingFlag) {
-    askRisingFlag = false;
-    if (askButtonDown) {
+  if (!askButtonDown) {
+    if ((raw || isrCaught) && now - askLastChangeTime >= DEBOUNCE_MS) {
+      askButtonDown = true;
+      askLastChangeTime = now;
+      return;  // progres: mulai ditekan -- jangan lanjut cek timeout di bawah
+                // (kalau tidak, klik SEBELUMnya yang masih "pending" bisa
+                // salah difinalisasi jadi klik-tunggal tepat saat klik BARU
+                // ini baru mulai, padahal seharusnya diberi kesempatan
+                // berpasangan jadi klik-ganda)
+    }
+  } else {
+    if (!raw && (now - askLastChangeTime >= DEBOUNCE_MS)) {
+      // Rilis terkonfirmasi (debounced).
       askButtonDown = false;
-      if (askClickPending &&
-          askRisingAt - askPendingSince <= DOUBLE_CLICK_MS) {
+      askLastChangeTime = now;
+      if (askClickPending && now - askPendingSince <= DOUBLE_CLICK_MS) {
         // Klik kedua datang dalam jendela -> klik-ganda.
         askClickPending = false;
         doubleClick = true;
@@ -239,16 +209,16 @@ void updateAskButton(bool &singleClick, bool &doubleClick) {
         // Klik pertama (atau klik sendirian) -- tunggu dulu, jangan
         // langsung dianggap klik-tunggal, siapa tahu ada klik kedua nyusul.
         askClickPending = true;
-        askPendingSince = askRisingAt;
+        askPendingSince = now;
       }
     }
-    return;
+    return;  // masih ditekan, atau baru rilis -- tidak ada progres lain
   }
 
-  // Tidak ada tekan/rilis baru -- kalau ada klik yg masih "nunggu" dan
+  // Tidak ada progres tekan/rilis -- kalau ada klik yg masih "nunggu" dan
   // jendela klik-ganda sudah lewat tanpa klik kedua, baru itu dipastikan
   // klik-tunggal.
-  if (askClickPending && millis() - askPendingSince > DOUBLE_CLICK_MS) {
+  if (askClickPending && now - askPendingSince > DOUBLE_CLICK_MS) {
     askClickPending = false;
     singleClick = true;
   }
@@ -996,11 +966,12 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  // Interrupt utk ketiga tombol -- lihat komentar panjang di bagian atas
-  // file soal kenapa ini penting (bukan cuma polling biasa). ASK pakai
-  // CHANGE (tekan + lepas) karena durasi tekannya dilacak; UP/DOWN cukup
-  // FALLING (cuma butuh tepi tekan).
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_ASK), onAskChange, CHANGE);
+  // Interrupt FALLING utk ketiga tombol -- lihat komentar panjang di bagian
+  // atas file soal kenapa ini penting (bukan cuma polling biasa). Semua
+  // keputusan status tekan/rilis & timestamp tetap lewat polling+debounce
+  // biasa di checkEdge()/updateAskButton(); interrupt di sini cuma jaring
+  // pengaman "jangan sampai kelewat kalau loop() lagi blocking".
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_ASK), onAskFalling, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_UP), onUpFalling, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_DOWN), onDownFalling, FALLING);
 
