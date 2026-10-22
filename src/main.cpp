@@ -1,15 +1,24 @@
 /*
  * Pocket AI Assistant — versi simulasi (Wokwi)
  * ------------------------------------------------
+ * Hardware: Seeed Studio XIAO ESP32-S3 + OLED SSD1306 + 3 tombol + LED.
  * Terinspirasi dari: https://www.huyvector.org/robots-kinetic/pocket-ai-assistant
- * (ESP32-C3 + OLED + mic I2S + ampli MAX98357 + speaker, firmware ESPHome)
+ * (desain asli pakai ESP32-C3 + mic I2S + ampli MAX98357 + speaker, firmware
+ * ESPHome -- proyek ini dipindah ke XIAO ESP32-S3 karena bentuknya lebih
+ * kecil/praktis utk device saku, dan punya lebih banyak pin bebas utk 3
+ * tombol di bawah).
+ *
+ * Tombol:
+ *   - ASK (D0)  : push-to-talk, tanya ke AI
+ *   - UP   (D1) : tampilkan jam (nanti: volume up kalau sudah ada speaker asli)
+ *   - DOWN (D3) : tampilkan jam (nanti: volume down kalau sudah ada speaker asli)
  *
  * KETERBATASAN SIMULASI:
  * Wokwi belum punya simulasi audio I2S yang nyata (tidak bisa merekam suara
  * asli dari mic maupun memutar suara dari speaker). Karena itu, versi
  * sementara ini memakai Serial Monitor sebagai pengganti suara:
  *
- *   1. Tekan tombol (push-to-talk)      -> status "LISTENING"
+ *   1. Tekan tombol ASK (push-to-talk)  -> status "LISTENING"
  *   2. Ketik pertanyaan di Serial Monitor, lalu Enter
  *   3. ESP32 memanggil NVIDIA NIM API (model Nemotron) lewat WiFi (internet
  *      asli, lewat gateway simulasi Wokwi)   -> status "THINKING"
@@ -18,8 +27,9 @@
  * Nanti kalau dipindah ke hardware fisik, cukup ganti bagian "ambil teks
  * pertanyaan" dari Serial.readStringUntil() menjadi hasil STT dari mic asli
  * (mis. lewat ESPHome voice_assistant + Home Assistant Assist, atau layanan
- * STT cloud), dan tambahkan I2S speaker (MAX98357) untuk TTS. Semua bagian
- * lain (state machine, pemanggilan API, tampilan OLED) tetap sama.
+ * STT cloud), dan tambahkan I2S speaker (MAX98357) untuk TTS -- tombol
+ * UP/DOWN tinggal disambung ke kontrol volume ampli-nya. Semua bagian lain
+ * (state machine, pemanggilan API, tampilan OLED) tetap sama.
  */
 
 #include <Arduino.h>
@@ -30,14 +40,20 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <time.h>
 
 #include "secrets.h"
 
-// ---------- Pin mapping (lihat diagram.json) ----------
-static const int PIN_I2C_SDA = 4;
-static const int PIN_I2C_SCL = 5;
-static const int PIN_BUTTON  = 3;   // push-to-talk, aktif LOW (ditarik ke GND saat ditekan)
-static const int PIN_LED     = 10;  // indikator status
+// ---------- Pin mapping (lihat diagram.json) -- XIAO ESP32-S3 ----------
+// Label D0-D10 di papan XIAO sesuai pinout resmi Seeed:
+// D0=GPIO1 D1=GPIO2 D2=GPIO3 D3=GPIO4 D4=GPIO5(SDA) D5=GPIO6(SCL)
+// D6=GPIO43(TX) D7=GPIO44(RX) D8=GPIO7 D9=GPIO8 D10=GPIO9
+static const int PIN_I2C_SDA   = 5;   // D4
+static const int PIN_I2C_SCL   = 6;   // D5
+static const int PIN_BTN_ASK   = 1;   // D0 -- push-to-talk, aktif LOW
+static const int PIN_BTN_UP    = 2;   // D1 -- aktif LOW
+static const int PIN_BTN_DOWN  = 4;   // D3 -- aktif LOW
+static const int PIN_LED       = 7;   // D8 -- indikator status
 
 // ---------- OLED ----------
 static const uint8_t SCREEN_WIDTH  = 128;
@@ -55,17 +71,47 @@ static const uint8_t MAX_BODY_LINES  = 6;
 static const int     BODY_START_Y    = 12;
 
 // ---------- State machine ----------
-enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED };
+enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED, STATE_CLOCK };
 AssistantState state = STATE_IDLE;
 
 String inputBuffer;      // buffer teks pertanyaan dari Serial
 unsigned long ledTimer = 0;
 bool ledOn = false;
 
-// Debounce tombol
-bool lastButtonRaw = HIGH;
-unsigned long lastDebounceTime = 0;
+// ---------------------------------------------------------
+// Debounce tombol -- dipakai bersama utk ketiga tombol (ASK/UP/DOWN) lewat
+// satu struct+fungsi, supaya tidak menduplikasi logika debounce 3x.
+// ---------------------------------------------------------
 static const unsigned long DEBOUNCE_MS = 40;
+
+struct Button {
+  int pin;
+  bool lastRaw;
+  bool stable;
+  unsigned long lastChange;
+};
+
+Button btnAsk  = { PIN_BTN_ASK,  HIGH, HIGH, 0 };
+Button btnUp   = { PIN_BTN_UP,   HIGH, HIGH, 0 };
+Button btnDown = { PIN_BTN_DOWN, HIGH, HIGH, 0 };
+
+// Mengembalikan true PERSIS SEKALI tiap kali tombol ditekan (falling edge
+// LOW setelah di-debounce). Tombol aktif LOW (INPUT_PULLUP + kaki ke GND).
+bool checkButtonPressed(Button &b) {
+  bool raw = digitalRead(b.pin);
+  if (raw != b.lastRaw) {
+    b.lastChange = millis();
+  }
+  bool pressedEdge = false;
+  if (millis() - b.lastChange > DEBOUNCE_MS) {
+    if (raw != b.stable) {
+      b.stable = raw;
+      if (b.stable == LOW) pressedEdge = true;
+    }
+  }
+  b.lastRaw = raw;
+  return pressedEdge;
+}
 
 // Polling pertanyaan dari HP via Home Assistant (lihat haGetQuestion())
 unsigned long haPollTimer = 0;
@@ -291,6 +337,60 @@ void setLed(bool on) {
 }
 
 // ---------------------------------------------------------
+// Tampilan jam (NTP) -- muncul saat tombol UP atau DOWN ditekan. Waktu
+// disinkronkan lewat NTP (butuh WiFi, otomatis coba sync di setup()).
+// Auto-kembali ke standby setelah CLOCK_TIMEOUT_MS tanpa aktivitas, dan
+// jarumnya ikut "jalan" (redraw tiap detik) selama layar ini tampil --
+// konsisten dengan tema "jangan statis" pada wajah robot.
+// ---------------------------------------------------------
+static const unsigned long CLOCK_TIMEOUT_MS = 5000;
+static const long GMT_OFFSET_SEC = 7 * 3600;  // WIB (UTC+7)
+static const int  DAYLIGHT_OFFSET_SEC = 0;    // Indonesia tidak pakai DST
+static const char *NTP_SERVER = "pool.ntp.org";
+
+unsigned long clockShownAt = 0;
+unsigned long clockLastTick = 0;
+
+void drawClockScreen() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("Jam");
+  display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 100)) {
+    display.setTextSize(1);
+    display.setCursor(0, 28);
+    display.println("Waktu belum sync.");
+    display.setCursor(0, 40);
+    display.println("Cek koneksi WiFi.");
+  } else {
+    char timeBuf[12];
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &timeinfo);
+    display.setTextSize(2);
+    display.setCursor(4, 24);
+    display.println(timeBuf);
+
+    char dateBuf[24];
+    strftime(dateBuf, sizeof(dateBuf), "%a, %d %b %Y", &timeinfo);
+    display.setTextSize(1);
+    display.setCursor(0, 48);
+    display.println(dateBuf);
+  }
+
+  display.display();
+}
+
+void enterClock() {
+  state = STATE_CLOCK;
+  clockShownAt = millis();
+  clockLastTick = millis();
+  drawClockScreen();
+}
+
+// ---------------------------------------------------------
 // Panggil NVIDIA NIM API (model Nemotron), kembalikan teks jawaban (atau
 // pesan error). Format request/respons mengikuti konvensi OpenAI-compatible
 // chat completions yang dipakai build.nvidia.com.
@@ -428,6 +528,20 @@ void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi tersambung, IP: " + WiFi.localIP().toString());
+
+    // Sinkronisasi jam lewat NTP (butuh WiFi, dicoba sekali di sini).
+    // Kalau gagal/timeout, drawClockScreen() nanti akan bilang "belum sync"
+    // saat tombol UP/DOWN ditekan -- tidak menghalangi fitur lain.
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {
+      char buf[32];
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      Serial.println(String("Jam tersinkron (NTP): ") + buf);
+    } else {
+      Serial.println("Sinkronisasi jam (NTP) gagal/timeout.");
+    }
+
     drawRobotFace("Siap! Tekan tombol");
     scheduleIdleAnim();
   } else {
@@ -589,7 +703,9 @@ void setup() {
   delay(300);
   Serial.println("\nPocket AI Assistant (simulasi Wokwi) - boot");
 
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_BTN_ASK, INPUT_PULLUP);
+  pinMode(PIN_BTN_UP, INPUT_PULLUP);
+  pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
@@ -606,24 +722,28 @@ void setup() {
 }
 
 void loop() {
-  // --- Baca tombol dengan debounce ---
-  bool raw = digitalRead(PIN_BUTTON);
-  if (raw != lastButtonRaw) {
-    lastDebounceTime = millis();
+  // --- Baca ketiga tombol (debounce via checkButtonPressed()) ---
+  bool askPressed  = checkButtonPressed(btnAsk);
+  bool upPressed   = checkButtonPressed(btnUp);
+  bool downPressed = checkButtonPressed(btnDown);
+
+  // Tombol ASK: mulai tanya (dari IDLE/ANSWERED/CLOCK -- menekan ASK saat
+  // lagi lihat jam langsung membatalkan jam & mulai tanya).
+  if (askPressed &&
+      (state == STATE_IDLE || state == STATE_ANSWERED || state == STATE_CLOCK)) {
+    enterListening();
   }
-  if (millis() - lastDebounceTime > DEBOUNCE_MS) {
-    static bool stableState = HIGH;
-    if (raw != stableState) {
-      stableState = raw;
-      // tombol aktif LOW (ditekan = LOW karena INPUT_PULLUP + kaki ke GND)
-      if (stableState == LOW) {
-        if (state == STATE_IDLE || state == STATE_ANSWERED) {
-          enterListening();
-        }
-      }
+
+  // Tombol UP/DOWN: tampilkan jam. Dari IDLE/ANSWERED -> masuk STATE_CLOCK.
+  // Kalau sudah di STATE_CLOCK, tekan lagi cukup reset timer auto-kembali
+  // (drawClockScreen() tetap di-refresh tiap detik oleh blok di bawah).
+  if (upPressed || downPressed) {
+    if (state == STATE_IDLE || state == STATE_ANSWERED) {
+      enterClock();
+    } else if (state == STATE_CLOCK) {
+      clockShownAt = millis();
     }
   }
-  lastButtonRaw = raw;
 
   // --- LED berkedip pelan saat LISTENING, menyala tetap saat THINKING ---
   if (state == STATE_LISTENING) {
@@ -678,5 +798,20 @@ void loop() {
   // --- Animasi idle (kedip & lirik kiri-kanan) selama standby ---
   if (state == STATE_IDLE) {
     updateIdleFace();
+  }
+
+  // --- Layar jam: refresh tiap detik (biar jarum detik "jalan"), lalu
+  // auto-kembali ke standby setelah CLOCK_TIMEOUT_MS tanpa tombol UP/DOWN
+  // ditekan lagi ---
+  if (state == STATE_CLOCK) {
+    if (millis() - clockLastTick > 1000) {
+      clockLastTick = millis();
+      drawClockScreen();
+    }
+    if (millis() - clockShownAt > CLOCK_TIMEOUT_MS) {
+      state = STATE_IDLE;
+      drawRobotFace("Siap! Tekan tombol");
+      scheduleIdleAnim();
+    }
   }
 }

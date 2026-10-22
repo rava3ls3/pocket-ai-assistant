@@ -9,12 +9,27 @@ tanpa perlu hardware fisik.
 
 | Bagian | Hardware asli (huyvector.org) | Versi simulasi ini |
 |---|---|---|
-| MCU | ESP32-C3 | ESP32-C3 DevKitM-1 (sama) |
+| MCU | ESP32-C3 | **Seeed Studio XIAO ESP32-S3** |
 | Tampilan | OLED | OLED SSD1306 128x64 I2C (sama) |
-| Input suara | Microphone module (I2S) | **Diganti**: ketik teks di Serial Monitor |
+| Input | Microphone (I2S) + 1 tombol | **Diganti**: 3 tombol (ASK/UP/DOWN) + ketik teks di Serial Monitor |
 | Output suara | Speaker + ampli MAX98357 | **Diganti**: teks di OLED + Serial Monitor |
 | Firmware | ESPHome | Arduino (C++) via PlatformIO |
 | Otak AI | Tidak disebutkan di web aslinya | NVIDIA NIM API (model Nemotron) lewat HTTPS |
+
+**Kenapa pindah ke XIAO ESP32-S3?** Bentuknya jauh lebih kecil/ringkas untuk
+device saku (form factor ~21x17.8mm), dan punya cukup pin bebas untuk 3
+tombol fisik (ASK, UP, DOWN) tanpa sesak.
+
+**3 tombol:**
+| Tombol | Pin | Fungsi sekarang | Fungsi nanti (hardware asli + speaker) |
+|---|---|---|---|
+| ASK | D0 | Push-to-talk, mulai tanya ke AI | Sama |
+| UP | D1 | Tampilkan jam (NTP) | Volume up |
+| DOWN | D3 | Tampilkan jam (NTP) | Volume down |
+
+Tekan ASK kapan saja (termasuk saat sedang lihat jam) untuk langsung mulai
+tanya. Tekan UP/DOWN untuk lihat jam — otomatis balik ke wajah robot standby
+setelah 5 detik tanpa tombol ditekan lagi.
 
 **Kenapa diganti?** Wokwi belum punya simulasi audio I2S yang nyata — tidak bisa
 merekam suara asli dari mic atau memutar suara dari speaker virtual. Supaya kamu
@@ -82,7 +97,7 @@ gambar/bitmap terpisah):
 
 ```
 pocket-ai-assistant/
-├── diagram.json          # rangkaian: ESP32-C3 + OLED + tombol + LED
+├── diagram.json          # rangkaian: XIAO ESP32-S3 + OLED + 3 tombol + LED
 ├── wokwi.toml             # konfigurasi simulator Wokwi (VS Code)
 ├── platformio.ini         # konfigurasi build (board, library)
 ├── src/
@@ -113,19 +128,21 @@ pocket-ai-assistant/
    ```bash
    pio run
    ```
-   (sudah diuji berhasil compile di environment ini — ukuran flash ~72%, RAM ~12%)
+   (sudah diuji berhasil compile di environment ini — ukuran flash ~27%, RAM ~14%
+   dari kapasitas XIAO ESP32-S3 yang jauh lebih besar dari ESP32-C3)
 4. **Jalankan simulasi**: buka `diagram.json` di VS Code, lalu tekan tombol
    ▶️ "Start Simulation" dari ekstensi Wokwi (atau `F1` → `Wokwi: Start Simulator`).
 
 ## Cara pakai di simulator
 
-1. Tunggu OLED menampilkan `WiFi OK. Tekan tombol untuk bertanya.`
-2. Klik tombol biru di diagram (atau pakai keyboard shortcut yang ditampilkan Wokwi).
+1. Tunggu OLED menampilkan wajah robot standby ("Siap! Tekan tombol").
+2. Klik tombol **merah (ASK)** di diagram untuk mulai tanya.
 3. Buka **Serial Monitor**, ketik pertanyaan, tekan Enter — misalnya:
    `Jam berapa sekarang di Jakarta kalau di London jam 9 pagi?`
-4. OLED akan menampilkan `Thinking...`, lalu jawaban singkat dari Nemotron.
+4. OLED akan menampilkan animasi "Mikir...", lalu jawaban singkat dari Nemotron.
    Jawaban lengkap selalu tercetak penuh di Serial Monitor.
-5. Tekan tombol lagi untuk bertanya hal lain.
+5. Tekan tombol **biru (UP/DOWN)** kapan saja untuk melihat jam (NTP).
+6. Tekan ASK lagi untuk bertanya hal baru.
 
 ## Tanya/baca jawaban panjang lewat HP (opsional, via Home Assistant + Firebase)
 
@@ -300,13 +317,20 @@ sebelum deploy.
   tampil simbol `**`/`#` mentah di notifikasi), tapi tidak selalu patuh —
   jadi ada pembersih markdown sederhana (`stripMarkdown()`) di firmware
   sebagai jaring pengaman.
-- Pin mapping (lihat `diagram.json`): I2C OLED di GPIO4 (SDA) / GPIO5 (SCL),
-  tombol di GPIO3 (aktif LOW), LED status di GPIO10.
+- Pin mapping XIAO ESP32-S3 (lihat `diagram.json` + komentar di
+  `src/main.cpp`): I2C OLED di D4/GPIO5 (SDA) & D5/GPIO6 (SCL), tombol ASK
+  di D0/GPIO1, UP di D1/GPIO2, DOWN di D3/GPIO4, LED status di D8/GPIO7.
+- `board-xiao-esp32-s3` masih berstatus **"undocumented"/eksperimental**
+  di Wokwi (lint selalu menampilkan info ini — normal, bukan error).
+  Selama sesi pengembangan ini juga sempat kehabisan kuota bulanan gratis
+  `wokwi-cli` (CI testing) karena banyaknya simulasi yang dijalankan untuk
+  verifikasi — kalau kamu menjalankan `wokwi-cli` sendiri dan dapat error
+  soal kuota, itu normal untuk akun free tier, bukan tanda ada yang rusak.
 
 ## Lanjut ke hardware fisik (sesuai desain asli)
 
-Kalau nanti pindah ke board ESP32-C3 + OLED + mic + MAX98357 + speaker yang
-asli, ada dua jalur:
+Kalau nanti pindah ke board XIAO ESP32-S3 + OLED + mic + MAX98357 + speaker
+yang asli, ada dua jalur:
 
 - **Tetap pakai firmware custom ini**: ganti bagian `Serial.readStringUntil()`
   di `src/main.cpp` dengan hasil Speech-to-Text dari mic I2S asli (misalnya pakai

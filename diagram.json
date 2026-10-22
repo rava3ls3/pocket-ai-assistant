@@ -4,56 +4,73 @@
   "editor": "wokwi",
   "parts": [
     {
-      "type": "board-esp32-c3-devkitm-1",
+      "type": "board-xiao-esp32-s3",
       "id": "esp",
       "top": 0,
       "left": 0,
-      "attrs": {}
+      "attrs": { "serialInterface": "USB_SERIAL_JTAG" }
     },
     {
       "type": "board-ssd1306",
       "id": "oled1",
-      "top": -40,
-      "left": 140,
+      "top": -60,
+      "left": 160,
       "attrs": { "i2cAddress": "0x3c" }
     },
     {
       "type": "wokwi-pushbutton",
-      "id": "btn1",
-      "top": 80,
-      "left": 140,
+      "id": "btnAsk",
+      "top": 60,
+      "left": 160,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnUp",
+      "top": 60,
+      "left": 220,
+      "attrs": { "color": "blue" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnDown",
+      "top": 120,
+      "left": 220,
       "attrs": { "color": "blue" }
     },
     {
       "type": "wokwi-led",
       "id": "led1",
-      "top": 140,
-      "left": 150,
+      "top": 120,
+      "left": 160,
       "attrs": { "color": "green" }
     },
     {
       "type": "wokwi-resistor",
       "id": "r1",
-      "top": 140,
-      "left": 190,
+      "top": 120,
+      "left": 120,
       "attrs": { "value": "220" }
     }
   ],
   "connections": [
-    [ "esp:TX",   "$serialMonitor:RX", "", [] ],
-    [ "esp:RX",   "$serialMonitor:TX", "", [] ],
+    [ "esp:D4",  "oled1:SDA", "green",  [] ],
+    [ "esp:D5",  "oled1:SCL", "yellow", [] ],
+    [ "esp:3V3", "oled1:VCC", "red",    [] ],
+    [ "esp:GND", "oled1:GND", "black",  [] ],
 
-    [ "esp:4",    "oled1:SDA",  "green",  [] ],
-    [ "esp:5",    "oled1:SCL",  "yellow", [] ],
-    [ "esp:3V3.1","oled1:VCC",  "red",    [] ],
-    [ "esp:GND.1","oled1:GND",  "black",  [] ],
+    [ "esp:D0",      "btnAsk:1.l", "orange", [] ],
+    [ "btnAsk:2.l",  "esp:GND",    "black",  [] ],
 
-    [ "esp:3",    "btn1:1.l",   "orange", [] ],
-    [ "btn1:2.l", "esp:GND.2",  "black",  [] ],
+    [ "esp:D1",      "btnUp:1.l",  "orange", [] ],
+    [ "btnUp:2.l",   "esp:GND",    "black",  [] ],
 
-    [ "esp:10",   "r1:1",       "blue",   [] ],
-    [ "r1:2",     "led1:A",     "blue",   [] ],
-    [ "led1:C",   "esp:GND.3",  "black",  [] ]
+    [ "esp:D3",      "btnDown:1.l","orange", [] ],
+    [ "btnDown:2.l", "esp:GND",    "black",  [] ],
+
+    [ "esp:D8",  "r1:1",      "blue",  [] ],
+    [ "r1:2",    "led1:A",    "blue",  [] ],
+    [ "led1:C",  "esp:GND",   "black", [] ]
   ],
   "dependencies": {}
 }
