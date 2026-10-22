@@ -108,13 +108,45 @@ bool ledOn = false;
 // ---------------------------------------------------------
 static const unsigned long DEBOUNCE_MS = 40;
 
-volatile bool askIsrFlag = false;
 volatile bool upIsrFlag = false;
 volatile bool downIsrFlag = false;
 
-void IRAM_ATTR onAskFalling() { askIsrFlag = true; }
 void IRAM_ATTR onUpFalling() { upIsrFlag = true; }
 void IRAM_ATTR onDownFalling() { downIsrFlag = true; }
+
+// ASK butuh DUA tepi (tekan + lepas), bukan cuma falling, karena ASK juga
+// melacak DURASI tekan (utk tekan-tahan masuk menu Pengaturan). Kalau cuma
+// falling edge yang ditangkap interrupt, durasi tekan tetap dihitung
+// dengan polling millis() dari loop() secara berkala -- rentan "tertelan"
+// sama panggilan blocking yang lama (mis. haGetQuestion() polling
+// Firebase saat idle), karena loop() tidak sempat mengecek ambang waktu
+// tekan-tahan sampai panggilan itu selesai. Dengan interrupt CHANGE
+// (falling DAN rising), timestamp AWAL dan AKHIR tekan sama-sama direkam
+// oleh hardware interrupt langsung saat kejadian -- begitu loop() longgar
+// lagi (walau telat), durasi tekan tetap bisa dihitung akurat dari dua
+// timestamp itu, bukan dari kapan loop() kebetulan sempat polling.
+volatile bool askFallingFlag = false;
+volatile unsigned long askFallingAt = 0;
+volatile bool askRisingFlag = false;
+volatile unsigned long askRisingAt = 0;
+volatile unsigned long askLastEventAt = 0;  // utk debounce tepi palsu langsung di ISR
+
+void IRAM_ATTR onAskChange() {
+  unsigned long now = millis();
+  // Debounce di level ISR: abaikan tepi yang muncul terlalu cepat setelah
+  // tepi sebelumnya (noise/bounce sesaat), supaya tidak merusak timestamp
+  // yang dipakai utk hitung durasi tekan (lihat updateAskButton()).
+  if (now - askLastEventAt < DEBOUNCE_MS) return;
+  askLastEventAt = now;
+
+  if (digitalRead(PIN_BTN_ASK) == LOW) {
+    askFallingFlag = true;
+    askFallingAt = now;
+  } else {
+    askRisingFlag = true;
+    askRisingAt = now;
+  }
+}
 
 struct SimpleButton {
   int pin;
@@ -152,37 +184,51 @@ bool checkEdge(SimpleButton &b) {
 // untuk masuk menu Pengaturan, jadi dapat penanganan state machine sendiri
 // (bukan cuma edge sederhana seperti UP/DOWN).
 static const unsigned long LONG_PRESS_MS = 1200;
-bool askButtonDown = false;
-unsigned long askDownSince = 0;
+bool askButtonDown = false;      // status "ditekan" saat ini
+unsigned long askDownSince = 0;  // timestamp (dari ISR) saat mulai ditekan
 bool askLongFired = false;
 
 void updateAskButton(bool &shortPress, bool &longPress) {
   shortPress = false;
   longPress = false;
 
-  bool raw = (digitalRead(PIN_BTN_ASK) == LOW);
-  bool isrCaught = askIsrFlag;
-  if (isrCaught) askIsrFlag = false;
-
-  if (!askButtonDown && (raw || isrCaught)) {
-    askButtonDown = true;
-    askDownSince = millis();
-    askLongFired = false;
+  if (askFallingFlag) {
+    askFallingFlag = false;
+    if (!askButtonDown) {
+      askButtonDown = true;
+      askDownSince = askFallingAt;  // timestamp dari ISR, bukan millis() saat ini
+      askLongFired = false;
+    }
   }
 
-  if (askButtonDown) {
-    if (raw) {
-      if (!askLongFired && millis() - askDownSince >= LONG_PRESS_MS) {
-        askLongFired = true;
-        longPress = true;
-      }
-    } else {
-      // Rilis (atau: isrCaught sempat true tapi raw sudah HIGH lagi --
-      // berarti seluruh tekan-lepas kejadian saat loop() blocking; anggap
-      // sebagai tekan-singkat karena kita tidak tahu durasi aslinya).
+  if (askRisingFlag) {
+    askRisingFlag = false;
+    if (askButtonDown) {
       askButtonDown = false;
-      if (!askLongFired) shortPress = true;
+      // Durasi dihitung dari DUA timestamp yang direkam interrupt (tekan &
+      // lepas), bukan dari kapan loop() ini kebetulan sempat jalan -- jadi
+      // tetap akurat walau loop() tadi blocking lama persis selama tombol
+      // ditahan (lihat komentar panjang di atas onAskChange()).
+      unsigned long heldMs = askRisingAt - askDownSince;
+      if (!askLongFired) {
+        if (heldMs >= LONG_PRESS_MS) {
+          askLongFired = true;
+          longPress = true;
+        } else {
+          shortPress = true;
+        }
+      }
     }
+    return;  // sudah pasti tuntas (tekan+lepas); tidak perlu cek "masih ditahan" di bawah
+  }
+
+  // Belum ada event rilis -- kalau masih ditekan, cek ambang tekan-tahan
+  // pakai waktu SEKARANG, supaya bisa langsung bereaksi begitu loop()
+  // longgar lagi tanpa perlu menunggu tombol dilepas dulu.
+  if (askButtonDown && !askLongFired &&
+      millis() - askDownSince >= LONG_PRESS_MS) {
+    askLongFired = true;
+    longPress = true;
   }
 }
 
@@ -618,6 +664,14 @@ String askNvidia(const String &question, bool concise = true) {
   WiFiClientSecure client;
   client.setInsecure(); // NOTE: skip verifikasi sertifikat TLS -> OK untuk simulasi/demo,
                         // JANGAN dipakai apa adanya untuk produk nyata.
+  // PENTING: https.setTimeout()/setConnectTimeout() di bawah HANYA membatasi
+  // fase TCP connect & baca data -- fase TLS handshake-nya sendiri dibatasi
+  // TERPISAH lewat setHandshakeTimeout() di WiFiClientSecure. Tanpa ini,
+  // handshake yang macet/lambat bisa membuat panggilan ini blocking jauh
+  // lebih lama dari timeout yang di-set (observasi langsung: bisa >10
+  // detik walau timeout di-set 3 detik).
+  client.setHandshakeTimeout(concise ? 15 : 45);
+  client.setTimeout(concise ? 15 : 45);
 
   HTTPClient https;
   String answer;
@@ -779,12 +833,20 @@ String firebasePath(const String &key) {
 // Timeout di-set pendek (3 detik) -- ini dipanggil tiap HA_POLL_INTERVAL_MS
 // saat standby, jadi dijaga singkat supaya jendela "loop() blocking" yang
 // bisa bikin tombol lain terasa delay (sebelum interrupt menangkapnya)
-// tetap sekecil mungkin.
+// tetap sekecil mungkin. PENTING: fase TLS handshake dibatasi TERPISAH
+// lewat client.setHandshakeTimeout() (bukan https.setTimeout()/
+// setConnectTimeout() yang cuma membatasi fase TCP connect & baca data) --
+// tanpa ini, handshake yang macet bisa membuat panggilan ini blocking jauh
+// lebih lama dari 3 detik yang dimaksud (terbukti langsung: tombol ASK
+// tekan-tahan bisa tidak terdeteksi sama sekali kalau ini kejadian persis
+// selama tombol ditahan).
 String haGetQuestion() {
   if (!haConfigured()) return "";
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(3);
+  client.setTimeout(3);
   HTTPClient https;
   String result;
 
@@ -811,6 +873,8 @@ void haClearQuestion() {
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(5);
+  client.setTimeout(5);
   HTTPClient https;
 
   if (https.begin(client, firebasePath("question"))) {
@@ -826,6 +890,8 @@ void haNotify(const String &question, const String &answer) {
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(5);
+  client.setTimeout(5);
   HTTPClient https;
 
   if (https.begin(client, firebasePath("answer"))) {
@@ -886,9 +952,11 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  // Interrupt falling-edge utk ketiga tombol -- lihat komentar panjang di
-  // bagian atas file soal kenapa ini penting (bukan cuma polling biasa).
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_ASK), onAskFalling, FALLING);
+  // Interrupt utk ketiga tombol -- lihat komentar panjang di bagian atas
+  // file soal kenapa ini penting (bukan cuma polling biasa). ASK pakai
+  // CHANGE (tekan + lepas) karena durasi tekannya dilacak; UP/DOWN cukup
+  // FALLING (cuma butuh tepi tekan).
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_ASK), onAskChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_UP), onUpFalling, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_DOWN), onDownFalling, FALLING);
 
@@ -917,7 +985,6 @@ void loop() {
   if (askShort || askLong || upPressed || downPressed) {
     wakeScreen();  // tombol apa pun membangunkan layar kalau sempat mati (timeout)
   }
-
   // --- Tekan-tahan ASK dari standby/jawaban = buka menu Pengaturan ---
   if (askLong && (state == STATE_IDLE || state == STATE_ANSWERED)) {
     enterSettings();
