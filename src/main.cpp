@@ -9,9 +9,19 @@
  * tombol di bawah).
  *
  * Tombol:
- *   - ASK (D0)  : push-to-talk, tanya ke AI
- *   - UP   (D1) : tampilkan jam (nanti: volume up kalau sudah ada speaker asli)
- *   - DOWN (D3) : tampilkan jam (nanti: volume down kalau sudah ada speaker asli)
+ *   - ASK (D0)  : tekan singkat = tanya ke AI. Tekan & tahan (>=1.2 detik)
+ *                 dari layar standby = buka menu Pengaturan.
+ *   - UP   (D1) : tampilkan jam. Di dalam menu Pengaturan: pindah ke item
+ *                 berikutnya.
+ *   - DOWN (D3) : tampilkan jam juga (nanti: volume down kalau sudah ada
+ *                 speaker asli). Di dalam menu Pengaturan: pindah ke item
+ *                 sebelumnya.
+ *
+ * Deteksi tombol pakai HARDWARE INTERRUPT (attachInterrupt), bukan cuma
+ * polling digitalRead() biasa -- supaya penekanan tombol tetap tertangkap
+ * walau loop() sedang "sibuk" di tengah panggilan network yang blocking
+ * (mis. polling Firebase tiap beberapa detik saat standby). Lihat
+ * checkEdge()/updateAskButton() untuk detail.
  *
  * KETERBATASAN SIMULASI:
  * Wokwi belum punya simulasi audio I2S yang nyata (tidak bisa merekam suara
@@ -28,8 +38,9 @@
  * pertanyaan" dari Serial.readStringUntil() menjadi hasil STT dari mic asli
  * (mis. lewat ESPHome voice_assistant + Home Assistant Assist, atau layanan
  * STT cloud), dan tambahkan I2S speaker (MAX98357) untuk TTS -- tombol
- * UP/DOWN tinggal disambung ke kontrol volume ampli-nya. Semua bagian lain
- * (state machine, pemanggilan API, tampilan OLED) tetap sama.
+ * UP/DOWN tinggal disambung ke kontrol volume ampli-nya (di luar menu
+ * Pengaturan). Semua bagian lain (state machine, pemanggilan API, tampilan
+ * OLED) tetap sama.
  */
 
 #include <Arduino.h>
@@ -41,8 +52,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include <Preferences.h>
 
 #include "secrets.h"
+
+#define FIRMWARE_VERSION "1.1.0"
 
 // ---------- Pin mapping (lihat diagram.json) -- XIAO ESP32-S3 ----------
 // Label D0-D10 di papan XIAO sesuai pinout resmi Seeed:
@@ -50,7 +64,7 @@
 // D6=GPIO43(TX) D7=GPIO44(RX) D8=GPIO7 D9=GPIO8 D10=GPIO9
 static const int PIN_I2C_SDA   = 5;   // D4
 static const int PIN_I2C_SCL   = 6;   // D5
-static const int PIN_BTN_ASK   = 1;   // D0 -- push-to-talk, aktif LOW
+static const int PIN_BTN_ASK   = 1;   // D0 -- aktif LOW
 static const int PIN_BTN_UP    = 2;   // D1 -- aktif LOW
 static const int PIN_BTN_DOWN  = 4;   // D3 -- aktif LOW
 static const int PIN_LED       = 7;   // D8 -- indikator status
@@ -64,14 +78,15 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // Tata letak teks: font size 1 ~= 6x8 px -> 21 kolom.
 // Body dimulai di y=12 (setelah judul + garis pemisah) dan layar tinggi 64px,
 // jadi ruang tersisa 52px -> maksimal 6 baris (6*8=48, pas tanpa meluber).
-// (Sebelumnya dipakai 7 baris -> total 68px, meluber 4px dan bikin baris
-// terakhir terlihat "bertumpuk"/terpotong di bagian bawah layar.)
 static const uint8_t CHARS_PER_LINE  = 21;
 static const uint8_t MAX_BODY_LINES  = 6;
 static const int     BODY_START_Y    = 12;
 
 // ---------- State machine ----------
-enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED, STATE_CLOCK };
+enum AssistantState {
+  STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED,
+  STATE_CLOCK, STATE_SETTINGS
+};
 AssistantState state = STATE_IDLE;
 
 String inputBuffer;      // buffer teks pertanyaan dari Serial
@@ -79,38 +94,96 @@ unsigned long ledTimer = 0;
 bool ledOn = false;
 
 // ---------------------------------------------------------
-// Debounce tombol -- dipakai bersama utk ketiga tombol (ASK/UP/DOWN) lewat
-// satu struct+fungsi, supaya tidak menduplikasi logika debounce 3x.
+// Deteksi tombol via HARDWARE INTERRUPT + debounce.
+//
+// Kenapa interrupt, bukan cuma polling digitalRead() di loop()? Karena
+// loop() ini kadang BLOCKING cukup lama (mis. haGetQuestion() polling
+// Firebase tiap beberapa detik saat standby, bisa makan waktu 1-3+ detik
+// untuk request HTTPS-nya). Tombol yang ditekan-lepas SELURUHNYA dalam
+// jendela waktu itu akan terlewat sama sekali kalau cuma mengandalkan
+// polling biasa -- device terasa "tidak merespons" padahal sebenarnya
+// cuma lagi sibuk network call. Interrupt menangkap tepi tekanan (falling
+// edge) seketika kapan pun terjadi, lepas dari apa yang sedang dikerjakan
+// loop() -- begitu loop() longgar lagi, flag-nya masih ada untuk diproses.
 // ---------------------------------------------------------
 static const unsigned long DEBOUNCE_MS = 40;
 
-struct Button {
+volatile bool askIsrFlag = false;
+volatile bool upIsrFlag = false;
+volatile bool downIsrFlag = false;
+
+void IRAM_ATTR onAskFalling() { askIsrFlag = true; }
+void IRAM_ATTR onUpFalling() { upIsrFlag = true; }
+void IRAM_ATTR onDownFalling() { downIsrFlag = true; }
+
+struct SimpleButton {
   int pin;
-  bool lastRaw;
-  bool stable;
-  unsigned long lastChange;
+  volatile bool *isrFlag;
+  bool down;
+  unsigned long lastChangeTime;
 };
 
-Button btnAsk  = { PIN_BTN_ASK,  HIGH, HIGH, 0 };
-Button btnUp   = { PIN_BTN_UP,   HIGH, HIGH, 0 };
-Button btnDown = { PIN_BTN_DOWN, HIGH, HIGH, 0 };
+SimpleButton btnUp   = { PIN_BTN_UP,   &upIsrFlag,   false, 0 };
+SimpleButton btnDown = { PIN_BTN_DOWN, &downIsrFlag, false, 0 };
 
-// Mengembalikan true PERSIS SEKALI tiap kali tombol ditekan (falling edge
-// LOW setelah di-debounce). Tombol aktif LOW (INPUT_PULLUP + kaki ke GND).
-bool checkButtonPressed(Button &b) {
-  bool raw = digitalRead(b.pin);
-  if (raw != b.lastRaw) {
-    b.lastChange = millis();
+// True PERSIS SEKALI tiap kali tombol baru ditekan (butuh rilis dulu
+// sebelum bisa memicu lagi). isrFlag dipakai sebagai jaring pengaman kalau
+// seluruh tekan-lepas kejadian di tengah loop() sedang blocking -- begitu
+// longgar lagi, raw sudah HIGH tapi isrFlag membuktikan sempat ada tekanan.
+bool checkEdge(SimpleButton &b) {
+  bool raw = (digitalRead(b.pin) == LOW);
+  bool isrCaught = *b.isrFlag;
+  if (isrCaught) *b.isrFlag = false;
+
+  if (!b.down && (raw || isrCaught)) {
+    if (millis() - b.lastChangeTime < DEBOUNCE_MS) return false;
+    b.down = true;
+    b.lastChangeTime = millis();
+    return true;
   }
-  bool pressedEdge = false;
-  if (millis() - b.lastChange > DEBOUNCE_MS) {
-    if (raw != b.stable) {
-      b.stable = raw;
-      if (b.stable == LOW) pressedEdge = true;
+  if (b.down && !raw) {
+    b.down = false;
+    b.lastChangeTime = millis();
+  }
+  return false;
+}
+
+// Tombol ASK butuh pembeda tekan-singkat vs tekan-tahan (>=LONG_PRESS_MS)
+// untuk masuk menu Pengaturan, jadi dapat penanganan state machine sendiri
+// (bukan cuma edge sederhana seperti UP/DOWN).
+static const unsigned long LONG_PRESS_MS = 1200;
+bool askButtonDown = false;
+unsigned long askDownSince = 0;
+bool askLongFired = false;
+
+void updateAskButton(bool &shortPress, bool &longPress) {
+  shortPress = false;
+  longPress = false;
+
+  bool raw = (digitalRead(PIN_BTN_ASK) == LOW);
+  bool isrCaught = askIsrFlag;
+  if (isrCaught) askIsrFlag = false;
+
+  if (!askButtonDown && (raw || isrCaught)) {
+    askButtonDown = true;
+    askDownSince = millis();
+    askLongFired = false;
+  }
+
+  if (askButtonDown) {
+    if (raw) {
+      if (!askLongFired && millis() - askDownSince >= LONG_PRESS_MS) {
+        askLongFired = true;
+        longPress = true;
+      }
+    } else {
+      // Rilis (atau: isrCaught sempat true tapi raw sudah HIGH lagi --
+      // berarti seluruh tekan-lepas kejadian saat loop() blocking; anggap
+      // sebagai tekan-singkat karena kita tidak tahu durasi aslinya).
+      askButtonDown = false;
+      if (!askLongFired) shortPress = true;
     }
   }
-  b.lastRaw = raw;
-  return pressedEdge;
 }
 
 // Polling pertanyaan dari HP via Home Assistant (lihat haGetQuestion())
@@ -124,12 +197,54 @@ unsigned long answeredAtTimer = 0;
 static const unsigned long ANSWERED_TIMEOUT_MS = 15000;
 
 // ---------------------------------------------------------
+// Pengaturan tersimpan (NVS via Preferences) -- bertahan walau direstart.
+// ---------------------------------------------------------
+Preferences prefs;
+
+struct Settings {
+  uint8_t brightness;     // index ke BRIGHTNESS_CONTRAST[]
+  uint8_t volume;         // 0..4 -> 0/25/50/75/100% (placeholder, blm ada speaker asli)
+  uint8_t screenTimeout;  // index ke SCREEN_TIMEOUT_MS[]
+};
+Settings settings = { 1, 2, 0 };  // default: kecerahan sedang, volume 50%, layar tidak pernah mati
+
+const uint8_t BRIGHTNESS_CONTRAST[3] = { 10, 127, 255 };
+const char *BRIGHTNESS_LABELS[3] = { "Rendah", "Sedang", "Tinggi" };
+
+const unsigned long SCREEN_TIMEOUT_MS[4] = { 0, 30000, 60000, 120000 };
+const char *SCREEN_TIMEOUT_LABELS[4] = { "Tidak pernah", "30 detik", "60 detik", "120 detik" };
+
+void applyBrightness() {
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(BRIGHTNESS_CONTRAST[settings.brightness]);
+}
+
+void loadSettings() {
+  prefs.begin("pocketai", true);  // read-only
+  settings.brightness = prefs.getUChar("bright", settings.brightness);
+  settings.volume = prefs.getUChar("volume", settings.volume);
+  settings.screenTimeout = prefs.getUChar("scrtimeout", settings.screenTimeout);
+  prefs.end();
+
+  if (settings.brightness > 2) settings.brightness = 1;
+  if (settings.volume > 4) settings.volume = 2;
+  if (settings.screenTimeout > 3) settings.screenTimeout = 0;
+}
+
+void saveSettings() {
+  prefs.begin("pocketai", false);  // read-write
+  prefs.putUChar("bright", settings.brightness);
+  prefs.putUChar("volume", settings.volume);
+  prefs.putUChar("scrtimeout", settings.screenTimeout);
+  prefs.end();
+}
+
+// ---------------------------------------------------------
 // Util tampilan: tulis judul status + body teks dengan word-wrap sederhana.
 // Two-pass: kumpulkan dulu baris-baris hasil wrap ke array (maks
 // MAX_BODY_LINES), baru digambar. Ini mencegah baris meluber ke luar batas
-// layar (yang sebelumnya menyebabkan tampilan terlihat "bertumpuk" saat
-// jawaban panjang) karena jumlah baris + indikator "..." sudah dijatah pasti
-// masuk dalam MAX_BODY_LINES, bukan ditambah di akhir seperti sebelumnya.
+// layar karena jumlah baris + indikator "..." sudah dijatah pasti masuk
+// dalam MAX_BODY_LINES, bukan ditambah di akhir.
 // ---------------------------------------------------------
 void showScreen(const String &title, const String &body) {
   display.clearDisplay();
@@ -149,7 +264,6 @@ void showScreen(const String &title, const String &body) {
   while (remaining.length() > 0 && lineCount < MAX_BODY_LINES) {
     int spaceIdx = -1;
     if ((int)remaining.length() > CHARS_PER_LINE) {
-      // cari spasi terakhir sebelum batas kolom, biar wrap per kata
       spaceIdx = remaining.substring(0, CHARS_PER_LINE + 1).lastIndexOf(' ');
     }
     String chunk;
@@ -160,16 +274,12 @@ void showScreen(const String &title, const String &body) {
       chunk = remaining.substring(0, spaceIdx);
       remaining = remaining.substring(spaceIdx + 1);
     } else {
-      // kata tunggal lebih panjang dari 1 baris -> potong paksa
       chunk = remaining.substring(0, CHARS_PER_LINE);
       remaining = remaining.substring(CHARS_PER_LINE);
     }
     lines[lineCount++] = chunk;
   }
 
-  // Kalau masih ada sisa teks setelah MAX_BODY_LINES baris penuh, timpa baris
-  // TERAKHIR dengan indikator "..." (bukan menambah baris baru di bawahnya),
-  // supaya total baris yang digambar tetap <= MAX_BODY_LINES.
   if (remaining.length() > 0) {
     lines[MAX_BODY_LINES - 1] = "..lengkap di Serial";
   }
@@ -189,8 +299,6 @@ void showScreen(const String &title, const String &body) {
 enum RobotExpression { FACE_NEUTRAL, FACE_SAD, FACE_HAPPY, FACE_THINKING };
 enum LookDir { LOOK_CENTER, LOOK_LEFT, LOOK_RIGHT };
 
-// Mata "senang": chevron melengkung ke atas ( ^ ), dipakai utk FACE_HAPPY
-// dan juga saat mata "tersenyum menyipit".
 void drawChevronEye(int x, int y) {
   display.drawLine(x, y + 5, x + 5, y, SSD1306_WHITE);
   display.drawLine(x + 5, y, x + 10, y + 5, SSD1306_WHITE);
@@ -213,7 +321,6 @@ void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL,
   const int headY = 4;
   const int antX = SCREEN_WIDTH / 2;
 
-  // Antena: terkulai saat sedih, tegak selain itu
   if (expr == FACE_SAD) {
     display.drawLine(antX, headY, antX - 5, headY - 6, SSD1306_WHITE);
     display.fillCircle(antX - 5, headY - 6, 2, SSD1306_WHITE);
@@ -222,10 +329,8 @@ void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL,
     display.fillCircle(antX, headY - 8, 2, SSD1306_WHITE);
   }
 
-  // Kepala
   display.drawRoundRect(headX, headY, headW, headH, 8, SSD1306_WHITE);
 
-  // Mata digeser kiri/kanan sedikit untuk kesan "melirik"
   int eyeShift = (look == LOOK_LEFT) ? -3 : (look == LOOK_RIGHT) ? 3 : 0;
   int eyeY = headY + 14;
   int lEyeX = headX + 11 + eyeShift;
@@ -233,21 +338,17 @@ void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL,
   const int EW = 10, EH = 14;
 
   if (expr == FACE_SAD) {
-    // Mata sedih: "X" di tiap mata (abaikan arah lirik/kedip)
     display.drawLine(lEyeX, eyeY, lEyeX + EW, eyeY + EH, SSD1306_WHITE);
     display.drawLine(lEyeX + EW, eyeY, lEyeX, eyeY + EH, SSD1306_WHITE);
     display.drawLine(rEyeX, eyeY, rEyeX + EW, eyeY + EH, SSD1306_WHITE);
     display.drawLine(rEyeX + EW, eyeY, rEyeX, eyeY + EH, SSD1306_WHITE);
   } else if (blinking) {
-    // Mata terpejam: garis tipis datar
     display.drawLine(lEyeX, eyeY + 7, lEyeX + EW, eyeY + 7, SSD1306_WHITE);
     display.drawLine(rEyeX, eyeY + 7, rEyeX + EW, eyeY + 7, SSD1306_WHITE);
   } else if (expr == FACE_HAPPY) {
-    // Mata senang: chevron melengkung ( ^ ^ )
     drawChevronEye(lEyeX, eyeY + 7);
     drawChevronEye(rEyeX, eyeY + 7);
   } else {
-    // Mata normal: kotak membulat terisi penuh
     display.fillRoundRect(lEyeX, eyeY, EW, EH, 3, SSD1306_WHITE);
     display.fillRoundRect(rEyeX, eyeY, EW, EH, 3, SSD1306_WHITE);
   }
@@ -255,22 +356,17 @@ void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL,
   int mouthY = headY + headH - 10;
   int mcx = headX + headW / 2;
   if (expr == FACE_SAD) {
-    // Cemberut: lengkungan terbalik
     display.drawLine(headX + 16, mouthY + 4, mcx, mouthY, SSD1306_WHITE);
     display.drawLine(mcx, mouthY, headX + headW - 16, mouthY + 4, SSD1306_WHITE);
   } else if (expr == FACE_HAPPY) {
-    // Senyum: lengkungan normal
     display.drawLine(headX + 16, mouthY, mcx, mouthY + 5, SSD1306_WHITE);
     display.drawLine(mcx, mouthY + 5, headX + headW - 16, mouthY, SSD1306_WHITE);
   } else if (expr == FACE_THINKING) {
-    // Bingung: mulut miring sebelah (skeptis)
     display.drawLine(headX + 18, mouthY, headX + headW - 14, mouthY - 3, SSD1306_WHITE);
   } else {
-    // Netral: garis datar simpel
     display.drawLine(headX + 16, mouthY, headX + headW - 16, mouthY, SSD1306_WHITE);
   }
 
-  // Caption singkat di bawah wajah
   display.setTextSize(1);
   display.setCursor(0, SCREEN_HEIGHT - 8);
   display.println(caption);
@@ -280,8 +376,7 @@ void drawRobotFace(const String &caption, RobotExpression expr = FACE_NEUTRAL,
 
 // ---------------------------------------------------------
 // Animasi idle: kedip & lirik kiri-kanan acak selama di layar standby,
-// supaya wajahnya "hidup" alih-alih diam saja. Dipanggil tiap loop() saat
-// state == STATE_IDLE; hanya redraw layar kalau ada perubahan.
+// supaya wajahnya "hidup" alih-alih diam saja.
 // ---------------------------------------------------------
 unsigned long nextBlinkAt = 0;
 unsigned long nextLookAt = 0;
@@ -289,6 +384,19 @@ unsigned long blinkEndAt = 0;
 unsigned long lookEndAt = 0;
 bool idleBlinking = false;
 LookDir idleLook = LOOK_CENTER;
+
+// Kapan terakhir ada aktivitas tombol apa pun, dipakai utk fitur "timeout
+// layar" (mematikan panel OLED hemat daya setelah idle lama).
+unsigned long lastActivityAt = 0;
+bool screenOff = false;
+
+void wakeScreen() {
+  if (screenOff) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    screenOff = false;
+  }
+  lastActivityAt = millis();
+}
 
 void scheduleIdleAnim() {
   unsigned long now = millis();
@@ -299,6 +407,15 @@ void scheduleIdleAnim() {
 }
 
 void updateIdleFace() {
+  // --- Timeout layar: matikan panel OLED hemat daya setelah idle lama ---
+  unsigned long timeoutMs = SCREEN_TIMEOUT_MS[settings.screenTimeout];
+  if (timeoutMs > 0 && !screenOff && millis() - lastActivityAt > timeoutMs) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    screenOff = true;
+    return;  // tidak perlu lanjut animasi kalau panel sudah mati
+  }
+  if (screenOff) return;  // panel mati, tunggu tombol (wakeScreen() dipanggil dari loop())
+
   unsigned long now = millis();
   bool changed = false;
 
@@ -337,11 +454,10 @@ void setLed(bool on) {
 }
 
 // ---------------------------------------------------------
-// Tampilan jam (NTP) -- muncul saat tombol UP atau DOWN ditekan. Waktu
-// disinkronkan lewat NTP (butuh WiFi, otomatis coba sync di setup()).
-// Auto-kembali ke standby setelah CLOCK_TIMEOUT_MS tanpa aktivitas, dan
-// jarumnya ikut "jalan" (redraw tiap detik) selama layar ini tampil --
-// konsisten dengan tema "jangan statis" pada wajah robot.
+// Tampilan jam (NTP) -- muncul saat tombol UP atau DOWN ditekan (di luar
+// menu Pengaturan). Waktu disinkronkan lewat NTP (butuh WiFi, otomatis
+// coba sync di setup()). Auto-kembali ke standby setelah CLOCK_TIMEOUT_MS
+// tanpa aktivitas, dan jarumnya ikut "jalan" (redraw tiap detik).
 // ---------------------------------------------------------
 static const unsigned long CLOCK_TIMEOUT_MS = 5000;
 static const long GMT_OFFSET_SEC = 7 * 3600;  // WIB (UTC+7)
@@ -391,13 +507,100 @@ void enterClock() {
 }
 
 // ---------------------------------------------------------
+// Menu Pengaturan -- dibuka dengan tekan-tahan tombol ASK (>=1.2 detik)
+// dari layar standby. UP/DOWN pindah antar item, tekan-singkat ASK
+// mengubah nilai item yang bisa diubah, tekan-tahan ASK lagi (atau idle
+// 15 detik) keluar & menyimpan ke NVS.
+// ---------------------------------------------------------
+enum SettingItem {
+  SET_BRIGHTNESS, SET_VOLUME, SET_WIFI, SET_TIMEOUT, SET_BATTERY, SET_FIRMWARE,
+  SET_COUNT
+};
+int settingIndex = 0;
+unsigned long settingsLastActivity = 0;
+static const unsigned long SETTINGS_IDLE_TIMEOUT_MS = 15000;
+
+void drawSettingsScreen() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("Setting " + String(settingIndex + 1) + "/" + String((int)SET_COUNT));
+  display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
+
+  display.setCursor(0, 12);
+  switch (settingIndex) {
+    case SET_BRIGHTNESS:
+      display.println("Kecerahan OLED");
+      display.setTextSize(2);
+      display.setCursor(0, 30);
+      display.println(BRIGHTNESS_LABELS[settings.brightness]);
+      break;
+
+    case SET_VOLUME:
+      display.println("Volume (speaker");
+      display.println("fisik blm ada)");
+      display.setTextSize(2);
+      display.setCursor(0, 38);
+      display.println(String(settings.volume * 25) + "%");
+      break;
+
+    case SET_WIFI:
+      display.println("WiFi:");
+      display.println(WiFi.SSID());
+      display.println("IP:" + WiFi.localIP().toString());
+      display.println(String(WiFi.RSSI()) + " dBm");
+      break;
+
+    case SET_TIMEOUT:
+      display.println("Timeout layar");
+      display.setTextSize(2);
+      display.setCursor(0, 30);
+      display.println(SCREEN_TIMEOUT_LABELS[settings.screenTimeout]);
+      break;
+
+    case SET_BATTERY:
+      display.println("Baterai:");
+      display.println("Board ini tidak");
+      display.println("punya sensor");
+      display.println("baterai bawaan.");
+      break;
+
+    case SET_FIRMWARE:
+      display.println("Firmware:");
+      display.println("Pocket AI v" FIRMWARE_VERSION);
+      display.println(String(__DATE__));
+      display.println("Heap:" + String(ESP.getFreeHeap() / 1024) + "KB");
+      break;
+  }
+
+  display.setCursor(0, SCREEN_HEIGHT - 8);
+  display.println("Up/Dwn:pilih Ask:ubah");
+
+  display.display();
+}
+
+void enterSettings() {
+  state = STATE_SETTINGS;
+  settingIndex = 0;
+  settingsLastActivity = millis();
+  drawSettingsScreen();
+}
+
+void exitSettings() {
+  saveSettings();
+  state = STATE_IDLE;
+  lastActivityAt = millis();
+  drawRobotFace("Siap! Tekan tombol");
+  scheduleIdleAnim();
+}
+
+// ---------------------------------------------------------
 // Panggil NVIDIA NIM API (model Nemotron), kembalikan teks jawaban (atau
 // pesan error). Format request/respons mengikuti konvensi OpenAI-compatible
 // chat completions yang dipakai build.nvidia.com.
 // ---------------------------------------------------------
-// Pembersih markdown sederhana. Modelnya diminta jangan pakai markdown di
-// system prompt, tapi tidak selalu patuh -- jadi dibersihkan programatik
-// di sini juga, supaya notifikasi/OLED tidak kotor simbol ** # dsb.
 void stripMarkdown(String &text) {
   text.replace("**", "");
   text.replace("$$", "");
@@ -423,11 +626,6 @@ String askNvidia(const String &question, bool concise = true) {
     return "Gagal membuka koneksi HTTPS";
   }
 
-  // Timeout default HTTPClient (~5 detik) sering kurang -- apalagi untuk
-  // jawaban panjang (mode tidak-concise, max_tokens lebih besar) yang makan
-  // waktu generate lebih lama di sisi NVIDIA. Kasih jatah lebih longgar.
-  // ~24 token/detik diamati dari Nemotron Lightning utk jawaban panjang --
-  // kasih jatah waktu yang nyaman di atas estimasi max_tokens / 24.
   https.setTimeout(concise ? 15000 : 45000);
   https.setConnectTimeout(10000);
 
@@ -439,10 +637,6 @@ String askNvidia(const String &question, bool concise = true) {
   reqDoc["max_tokens"] = concise ? 300 : 800;
   reqDoc["temperature"] = 0.6;
   reqDoc["stream"] = false;
-  // Nemotron 3.x adalah model reasoning: tanpa ini, jawabannya ditaruh di
-  // field "reasoning_content" (bukan "content") dan bisa menghabiskan semua
-  // max_tokens cuma untuk proses "berpikir", sehingga "content" kosong.
-  // Matikan reasoning-nya supaya langsung jawab singkat & field content terisi.
   reqDoc["chat_template_kwargs"]["thinking"] = false;
 
   JsonArray messages = reqDoc["messages"].to<JsonArray>();
@@ -488,9 +682,6 @@ String askNvidia(const String &question, bool concise = true) {
       if (text) {
         answer = String(text);
       } else {
-        // Fallback jaga-jaga: kalau model tetap masuk mode reasoning (field
-        // "content" kosong), tampilkan potongan "reasoning_content" daripada
-        // kosong total.
         const char *reasoning = msgObj["reasoning_content"];
         answer = reasoning ? ("[reasoning] " + String(reasoning))
                             : "(respons kosong, coba lagi)";
@@ -529,9 +720,6 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi tersambung, IP: " + WiFi.localIP().toString());
 
-    // Sinkronisasi jam lewat NTP (butuh WiFi, dicoba sekali di sini).
-    // Kalau gagal/timeout, drawClockScreen() nanti akan bilang "belum sync"
-    // saat tombol UP/DOWN ditekan -- tidak menghalangi fitur lain.
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 5000)) {
@@ -544,6 +732,7 @@ void connectWiFi() {
 
     drawRobotFace("Siap! Tekan tombol");
     scheduleIdleAnim();
+    lastActivityAt = millis();
   } else {
     Serial.println("WiFi GAGAL tersambung.");
     drawRobotFace("WiFi gagal :(", FACE_SAD);
@@ -586,9 +775,11 @@ String firebasePath(const String &key) {
   return String(FIREBASE_DB_URL) + "/" + FIREBASE_SECRET_PATH + "/" + key + ".json";
 }
 
-// Ambil pertanyaan dari Firebase (hasil ketikan di app HA Companion di HP,
-// diteruskan HA ke Firebase lewat automation). String kosong = tidak
-// ada/gagal/null.
+// Ambil pertanyaan dari Firebase. String kosong = tidak ada/gagal/null.
+// Timeout di-set pendek (3 detik) -- ini dipanggil tiap HA_POLL_INTERVAL_MS
+// saat standby, jadi dijaga singkat supaya jendela "loop() blocking" yang
+// bisa bikin tombol lain terasa delay (sebelum interrupt menangkapnya)
+// tetap sekecil mungkin.
 String haGetQuestion() {
   if (!haConfigured()) return "";
 
@@ -597,16 +788,14 @@ String haGetQuestion() {
   HTTPClient https;
   String result;
 
-  // Query param acak (cache-buster) -- jaga-jaga terhadap kemungkinan
-  // caching di jalur GET (proxy/gateway), supaya tidak dapat respons basi.
   String url = firebasePath("question") + "?cb=" + String(millis());
   if (https.begin(client, url)) {
+    https.setTimeout(3000);
+    https.setConnectTimeout(3000);
     int code = https.GET();
     if (code == 200) {
       String payload = https.getString();
       payload.trim();
-      // Firebase RTDB kembalikan string JSON ber-quote (mis. "halo"), atau
-      // literal null kalau belum ada nilai.
       if (payload != "null" && payload.length() >= 2 &&
           payload.startsWith("\"") && payload.endsWith("\"")) {
         result = payload.substring(1, payload.length() - 1);
@@ -617,8 +806,6 @@ String haGetQuestion() {
   return result;
 }
 
-// Kosongkan lagi field "question" di Firebase setelah diproses, supaya
-// tidak terus-terusan ke-trigger ulang oleh nilai yang sama.
 void haClearQuestion() {
   if (!haConfigured()) return;
 
@@ -633,12 +820,9 @@ void haClearQuestion() {
   }
 }
 
-// Tulis jawaban lengkap ke Firebase -> automation di HA (polling tiap ~5
-// detik) mendeteksinya dan mengirim sebagai persistent_notification ke app
-// HA Companion di HP, bisa dibaca penuh tanpa batas panjang.
 void haNotify(const String &question, const String &answer) {
   if (!haConfigured()) return;
-  (void)question; // judul tidak disertakan di sisi Firebase; HA yang format pesan
+  (void)question;
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -662,10 +846,6 @@ void enterThinking(const String &question, bool concise = true) {
   state = STATE_THINKING;
   setLed(true);
 
-  // Animasi singkat "mikir" (lirik kiri-kanan, lalu kedip) sebelum masuk ke
-  // layar teks yang menampilkan pertanyaan -- biar transisinya tidak kaku.
-  // Dipakai delay() pendek karena ini cuma sekilas (~700ms total), bukan
-  // animasi berkelanjutan selama nunggu respons API yang (blocking).
   drawRobotFace("Mikir...", FACE_THINKING, LOOK_LEFT);
   delay(250);
   drawRobotFace("Mikir...", FACE_THINKING, LOOK_RIGHT);
@@ -681,14 +861,10 @@ void enterThinking(const String &question, bool concise = true) {
   Serial.println("Jawaban lengkap:");
   Serial.println(answer);
 
-  // Selalu juga dikirim ke HA (kalau sudah dikonfigurasi) -- baik pertanyaan
-  // datang dari tombol+Serial maupun dari HP, jawabannya tetap bisa dibaca
-  // penuh lewat notifikasi app HA Companion.
   haNotify(question, answer);
 
   setLed(false);
 
-  // Kilas senang sebentar begitu jawaban datang, sebelum tampil teksnya.
   drawRobotFace("Ketemu!", FACE_HAPPY);
   delay(600);
 
@@ -702,6 +878,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\nPocket AI Assistant (simulasi Wokwi) - boot");
+  Serial.println("Firmware v" FIRMWARE_VERSION ", build " __DATE__ " " __TIME__);
 
   pinMode(PIN_BTN_ASK, INPUT_PULLUP);
   pinMode(PIN_BTN_UP, INPUT_PULLUP);
@@ -709,7 +886,15 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  randomSeed(esp_random());  // biar animasi idle (kedip/lirik) tidak selalu pola sama
+  // Interrupt falling-edge utk ketiga tombol -- lihat komentar panjang di
+  // bagian atas file soal kenapa ini penting (bukan cuma polling biasa).
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_ASK), onAskFalling, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_UP), onUpFalling, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_DOWN), onDownFalling, FALLING);
+
+  randomSeed(esp_random());
+
+  loadSettings();
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
@@ -717,31 +902,67 @@ void setup() {
     Serial.println("SSD1306 OLED tidak terdeteksi!");
   }
   display.setRotation(0);
+  applyBrightness();
 
   connectWiFi();
 }
 
 void loop() {
-  // --- Baca ketiga tombol (debounce via checkButtonPressed()) ---
-  bool askPressed  = checkButtonPressed(btnAsk);
-  bool upPressed   = checkButtonPressed(btnUp);
-  bool downPressed = checkButtonPressed(btnDown);
+  // --- Baca tombol ASK (short vs long press) dan UP/DOWN (edge biasa) ---
+  bool askShort, askLong;
+  updateAskButton(askShort, askLong);
+  bool upPressed = checkEdge(btnUp);
+  bool downPressed = checkEdge(btnDown);
 
-  // Tombol ASK: mulai tanya (dari IDLE/ANSWERED/CLOCK -- menekan ASK saat
-  // lagi lihat jam langsung membatalkan jam & mulai tanya).
-  if (askPressed &&
-      (state == STATE_IDLE || state == STATE_ANSWERED || state == STATE_CLOCK)) {
-    enterListening();
+  if (askShort || askLong || upPressed || downPressed) {
+    wakeScreen();  // tombol apa pun membangunkan layar kalau sempat mati (timeout)
   }
 
-  // Tombol UP/DOWN: tampilkan jam. Dari IDLE/ANSWERED -> masuk STATE_CLOCK.
-  // Kalau sudah di STATE_CLOCK, tekan lagi cukup reset timer auto-kembali
-  // (drawClockScreen() tetap di-refresh tiap detik oleh blok di bawah).
+  // --- Tekan-tahan ASK dari standby/jawaban = buka menu Pengaturan ---
+  if (askLong && (state == STATE_IDLE || state == STATE_ANSWERED)) {
+    enterSettings();
+  }
+  // Tekan-tahan ASK lagi SAAT di menu Pengaturan = keluar & simpan.
+  else if (askLong && state == STATE_SETTINGS) {
+    exitSettings();
+  }
+  // Tekan-singkat ASK: mulai tanya (dari IDLE/ANSWERED/CLOCK -- menekan ASK
+  // saat lagi lihat jam langsung membatalkan jam & mulai tanya).
+  else if (askShort &&
+           (state == STATE_IDLE || state == STATE_ANSWERED || state == STATE_CLOCK)) {
+    enterListening();
+  }
+  // Tekan-singkat ASK di dalam menu Pengaturan: ubah/cycle nilai item aktif.
+  else if (askShort && state == STATE_SETTINGS) {
+    switch (settingIndex) {
+      case SET_BRIGHTNESS:
+        settings.brightness = (settings.brightness + 1) % 3;
+        applyBrightness();
+        break;
+      case SET_VOLUME:
+        settings.volume = (settings.volume + 1) % 5;
+        break;
+      case SET_TIMEOUT:
+        settings.screenTimeout = (settings.screenTimeout + 1) % 4;
+        break;
+      default:
+        break;  // item read-only (WiFi/Baterai/Firmware): tekan ASK tidak ngapa-ngapain
+    }
+    settingsLastActivity = millis();
+    drawSettingsScreen();
+  }
+
+  // --- Tombol UP/DOWN ---
   if (upPressed || downPressed) {
-    if (state == STATE_IDLE || state == STATE_ANSWERED) {
+    if (state == STATE_SETTINGS) {
+      settingIndex = upPressed ? (settingIndex + 1) % SET_COUNT
+                                : (settingIndex - 1 + SET_COUNT) % SET_COUNT;
+      settingsLastActivity = millis();
+      drawSettingsScreen();
+    } else if (state == STATE_IDLE || state == STATE_ANSWERED) {
       enterClock();
     } else if (state == STATE_CLOCK) {
-      clockShownAt = millis();
+      clockShownAt = millis();  // reset timer auto-kembali
     }
   }
 
@@ -768,8 +989,11 @@ void loop() {
   }
 
   // --- Polling pertanyaan dari HP (lewat helper input_text di HA) ---
-  // Hanya dicek saat device sedang tidak sibuk (IDLE/ANSWERED), supaya tidak
-  // mengganggu alur tombol+Serial yang sedang berjalan.
+  // Hanya dicek saat device sedang tidak sibuk (IDLE/ANSWERED). Panggilan
+  // di dalam haGetQuestion() ini BLOCKING (network) -- inilah skenario yang
+  // dulu bikin tombol kadang terasa tidak merespons sebelum dipindah ke
+  // interrupt; sekarang aman karena interrupt menangkap tekanan tombol
+  // terlepas dari kapan blocking call ini terjadi.
   if (haConfigured() &&
       (state == STATE_IDLE || state == STATE_ANSWERED) &&
       millis() - haPollTimer > HA_POLL_INTERVAL_MS) {
@@ -783,7 +1007,7 @@ void loop() {
       lastHaQuestion = q;
       Serial.println();
       Serial.println("=== Pertanyaan baru dari HP (Home Assistant) ===");
-      enterThinking(q, false);  // dari HP -> boleh jawaban lengkap, tidak dipaksa 3 kalimat
+      enterThinking(q, false);
       haClearQuestion();
     }
   }
@@ -791,18 +1015,18 @@ void loop() {
   // --- Auto-kembali ke standby (wajah robot) kalau tidak ada aktivitas ---
   if (state == STATE_ANSWERED && millis() - answeredAtTimer > ANSWERED_TIMEOUT_MS) {
     state = STATE_IDLE;
+    lastActivityAt = millis();
     drawRobotFace("Siap! Tekan tombol");
     scheduleIdleAnim();
   }
 
-  // --- Animasi idle (kedip & lirik kiri-kanan) selama standby ---
+  // --- Animasi idle (kedip & lirik kiri-kanan) + timeout layar selama standby ---
   if (state == STATE_IDLE) {
     updateIdleFace();
   }
 
-  // --- Layar jam: refresh tiap detik (biar jarum detik "jalan"), lalu
-  // auto-kembali ke standby setelah CLOCK_TIMEOUT_MS tanpa tombol UP/DOWN
-  // ditekan lagi ---
+  // --- Layar jam: refresh tiap detik, auto-kembali ke standby setelah
+  // CLOCK_TIMEOUT_MS tanpa tombol UP/DOWN ditekan lagi ---
   if (state == STATE_CLOCK) {
     if (millis() - clockLastTick > 1000) {
       clockLastTick = millis();
@@ -810,8 +1034,15 @@ void loop() {
     }
     if (millis() - clockShownAt > CLOCK_TIMEOUT_MS) {
       state = STATE_IDLE;
+      lastActivityAt = millis();
       drawRobotFace("Siap! Tekan tombol");
       scheduleIdleAnim();
     }
+  }
+
+  // --- Menu Pengaturan: auto-keluar & simpan kalau idle terlalu lama ---
+  if (state == STATE_SETTINGS &&
+      millis() - settingsLastActivity > SETTINGS_IDLE_TIMEOUT_MS) {
+    exitSettings();
   }
 }

@@ -21,15 +21,17 @@ device saku (form factor ~21x17.8mm), dan punya cukup pin bebas untuk 3
 tombol fisik (ASK, UP, DOWN) tanpa sesak.
 
 **3 tombol:**
-| Tombol | Pin | Fungsi sekarang | Fungsi nanti (hardware asli + speaker) |
-|---|---|---|---|
-| ASK | D0 | Push-to-talk, mulai tanya ke AI | Sama |
-| UP | D1 | Tampilkan jam (NTP) | Volume up |
-| DOWN | D3 | Tampilkan jam (NTP) | Volume down |
+| Tombol | Pin | Tekan singkat | Tekan & tahan (≥1.2 detik) | Fungsi nanti (hardware asli + speaker) |
+|---|---|---|---|---|
+| ASK | D0 | Push-to-talk, mulai tanya ke AI | Buka/tutup menu **Pengaturan** (dari standby/jawaban) | Sama |
+| UP | D1 | Tampilkan jam (NTP) / pindah item berikutnya di menu Pengaturan | — | Volume up |
+| DOWN | D3 | Tampilkan jam (NTP) / pindah item sebelumnya di menu Pengaturan | — | Volume down |
 
 Tekan ASK kapan saja (termasuk saat sedang lihat jam) untuk langsung mulai
 tanya. Tekan UP/DOWN untuk lihat jam — otomatis balik ke wajah robot standby
-setelah 5 detik tanpa tombol ditekan lagi.
+setelah 5 detik tanpa tombol ditekan lagi. Tekan & tahan ASK dari layar
+standby atau jawaban untuk membuka menu **Pengaturan** (lihat bagian
+terpisah di bawah).
 
 **Kenapa diganti?** Wokwi belum punya simulasi audio I2S yang nyata — tidak bisa
 merekam suara asli dari mic atau memutar suara dari speaker virtual. Supaya kamu
@@ -92,6 +94,30 @@ gambar/bitmap terpisah):
 | **Mikir** | Sekilas (~700ms) saat mulai memproses pertanyaan | Mulut miring, mata lirik kiri→kanan→kedip |
 | **Senang** | Sekilas (~600ms) begitu jawaban diterima | Mata melengkung "^ ^", senyum |
 | **Sedih** | WiFi gagal connect | Mata "X", mulut cemberut, antena terkulai |
+
+## Menu Pengaturan
+
+Tekan & tahan tombol **ASK** (≥1.2 detik) dari layar standby atau layar
+jawaban untuk membuka menu Pengaturan. Di dalam menu:
+
+- **UP / DOWN** → pindah ke item berikutnya/sebelumnya
+- **ASK (tekan singkat)** → ubah/cycle nilai item yang sedang aktif
+- **ASK (tekan & tahan lagi)** → keluar dari menu & simpan ke memori
+  (bertahan walau direstart/dimatikan)
+- Otomatis keluar & simpan juga kalau tidak ada tombol ditekan selama 15 detik
+
+6 item yang bisa dilihat/diatur:
+| Item | Bisa diubah? | Keterangan |
+|---|---|---|
+| **Kecerahan** | Ya (Rendah/Sedang/Tinggi) | Kontrol kontras OLED asli (`ssd1306_command`), bukan cuma label |
+| **Volume** | Ya (0/25/50/75/100%) | Tersimpan, tapi belum berpengaruh ke suara apa pun — menunggu speaker fisik (MAX98357) |
+| **WiFi** | Tidak (info saja) | SSID, IP, dan kekuatan sinyal (RSSI) saat ini |
+| **Timeout layar** | Ya (Tidak pernah/30/60/120 detik) | Setelah idle selaman itu saat standby, panel OLED dimatikan hemat daya (`SSD1306_DISPLAYOFF`); tombol apa pun menyalakannya lagi |
+| **Baterai** | Tidak (info saja) | XIAO ESP32-S3 tidak punya pin sensor baterai bawaan yang standar, jadi ditampilkan sebagai keterangan, bukan angka dikira-kira |
+| **Firmware** | Tidak (info saja) | Versi firmware, tanggal build, dan sisa heap RAM |
+
+Nilai Kecerahan, Volume, dan Timeout layar disimpan ke NVS (`Preferences`)
+sehingga tetap tersimpan setelah ESP32 di-restart atau kehilangan daya.
 
 ## Struktur file
 
@@ -317,6 +343,15 @@ sebelum deploy.
   tampil simbol `**`/`#` mentah di notifikasi), tapi tidak selalu patuh —
   jadi ada pembersih markdown sederhana (`stripMarkdown()`) di firmware
   sebagai jaring pengaman.
+- **Deteksi tombol pakai hardware interrupt** (`attachInterrupt`), bukan
+  cuma polling `digitalRead()` biasa di `loop()`. Sebelumnya ada bug: saat
+  standby, firmware polling Firebase tiap ~4 detik lewat panggilan HTTPS
+  yang *blocking* — kalau tombol ditekan-lepas seluruhnya persis di
+  jendela waktu itu, `loop()` tidak sempat mengeceknya sama sekali dan
+  tekanannya hilang (device terasa "tidak merespons", tapi sebenarnya cuma
+  lagi sibuk network call). Interrupt menangkap tepi tekanan tombol
+  seketika kapan pun terjadi, lepas dari apa yang sedang dikerjakan
+  `loop()`, jadi tekanan tombol tidak pernah hilang lagi.
 - Pin mapping XIAO ESP32-S3 (lihat `diagram.json` + komentar di
   `src/main.cpp`): I2C OLED di D4/GPIO5 (SDA) & D5/GPIO6 (SCL), tombol ASK
   di D0/GPIO1, UP di D1/GPIO2, DOWN di D3/GPIO4, LED status di D8/GPIO7.
