@@ -570,11 +570,6 @@ void drawSettingsHome() {
   display.println("Pengaturan");
   display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
 
-  display.setCursor(4, 28);
-  display.println("Klik ASK 2x cepat");
-  display.setCursor(4, 40);
-  display.println("utk masuk menu");
-
   display.display();
 }
 
