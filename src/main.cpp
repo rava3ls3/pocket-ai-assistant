@@ -88,7 +88,7 @@ static const int     BODY_START_Y    = 12;
 // ---------- State machine ----------
 enum AssistantState {
   STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_ANSWERED,
-  STATE_CLOCK, STATE_SETTINGS, STATE_SETTINGS_EDIT
+  STATE_CLOCK, STATE_SETTINGS_HOME, STATE_SETTINGS, STATE_SETTINGS_EDIT
 };
 AssistantState state = STATE_IDLE;
 
@@ -492,17 +492,15 @@ void setLed(bool on) {
 }
 
 // ---------------------------------------------------------
-// Tampilan jam (NTP) -- muncul saat tombol UP atau DOWN ditekan (di luar
-// menu Pengaturan). Waktu disinkronkan lewat NTP (butuh WiFi, otomatis
-// coba sync di setup()). Auto-kembali ke standby setelah CLOCK_TIMEOUT_MS
-// tanpa aktivitas, dan jarumnya ikut "jalan" (redraw tiap detik).
+// Tampilan jam (NTP) -- salah satu dari 3 layar "rumah" yang di-loop lewat
+// UP/DOWN (AI -> Jam -> Pengaturan -> AI -> ...), lihat enterNextHomeScreen().
+// Waktu disinkronkan lewat NTP (butuh WiFi, otomatis coba sync di setup()).
+// Jarumnya ikut "jalan" selama layar ini aktif (redraw tiap detik).
 // ---------------------------------------------------------
-static const unsigned long CLOCK_TIMEOUT_MS = 5000;
 static const long GMT_OFFSET_SEC = 7 * 3600;  // WIB (UTC+7)
 static const int  DAYLIGHT_OFFSET_SEC = 0;    // Indonesia tidak pakai DST
 static const char *NTP_SERVER = "pool.ntp.org";
 
-unsigned long clockShownAt = 0;
 unsigned long clockLastTick = 0;
 
 void drawClockScreen() {
@@ -539,24 +537,85 @@ void drawClockScreen() {
 
 void enterClock() {
   state = STATE_CLOCK;
-  clockShownAt = millis();
   clockLastTick = millis();
   drawClockScreen();
 }
 
 // ---------------------------------------------------------
-// Menu Pengaturan -- navigasi dua level:
+// Menu Pengaturan -- navigasi TIGA level (dulu dibuka langsung dari standby
+// pakai klik-ganda, tapi ternyata klik-ganda dari sembarang layar terasa
+// sulit/kurang jelas -- sekarang klik-ganda cuma berlaku di layar
+// "Pengaturan" (launcher) secara khusus, yang dicapai lewat navigasi
+// UP/DOWN biasa yang sudah terbukti gampang):
+//   - HOME (STATE_SETTINGS_HOME): layar "Pengaturan" sbg bagian dari loop
+//     3 layar rumah (AI -> Jam -> Pengaturan -> AI -> ...), lihat
+//     enterNextHomeScreen(). Klik-ganda ASK di sini = masuk LIST.
 //   - LIST (STATE_SETTINGS): UP/DOWN pindah antar 6 item. Klik-ganda ASK
 //     (<=1 detik) pada item yang bisa diubah (Kecerahan/Volume/Timeout
 //     layar) masuk ke mode EDIT; pada item read-only (WiFi/Baterai/
-//     Firmware) klik-ganda tidak ngapa-ngapain. Klik-tunggal ASK keluar
-//     menu, balik ke standby.
+//     Firmware) klik-ganda tidak ngapa-ngapain. Klik-tunggal ASK keluar,
+//     balik ke layar HOME (Pengaturan).
 //   - EDIT (STATE_SETTINGS_EDIT): UP/DOWN mengubah nilai item yang sedang
 //     aktif. Klik-tunggal ASK kembali ke LIST (nilai sudah otomatis
 //     kepakai & tersimpan).
-// Dibuka dari standby/jawaban dengan klik-ganda ASK. Idle 15 detik di
-// LIST maupun EDIT otomatis keluar & menyimpan ke NVS.
+// Idle 15 detik di LIST maupun EDIT otomatis keluar satu level & menyimpan
+// ke NVS.
 // ---------------------------------------------------------
+void drawSettingsHome() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("Pengaturan");
+  display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
+
+  display.setCursor(4, 28);
+  display.println("Klik ASK 2x cepat");
+  display.setCursor(4, 40);
+  display.println("utk masuk menu");
+
+  display.display();
+}
+
+void enterSettingsHome() {
+  state = STATE_SETTINGS_HOME;
+  lastActivityAt = millis();
+  drawSettingsHome();
+}
+
+// Loop 3 layar "rumah" (AI standby -> Jam -> Pengaturan -> AI -> ...),
+// dipindah pakai UP (maju) / DOWN (mundur). STATE_ANSWERED dianggap setara
+// "AI" (menekan UP/DOWN sambil lihat jawaban langsung masuk ke loop ini).
+void enterNextHomeScreen(bool forward) {
+  if (state == STATE_CLOCK) {
+    if (forward) {
+      enterSettingsHome();
+    } else {
+      state = STATE_IDLE;
+      lastActivityAt = millis();
+      drawRobotFace("Siap! Tekan tombol");
+      scheduleIdleAnim();
+    }
+  } else if (state == STATE_SETTINGS_HOME) {
+    if (forward) {
+      state = STATE_IDLE;
+      lastActivityAt = millis();
+      drawRobotFace("Siap! Tekan tombol");
+      scheduleIdleAnim();
+    } else {
+      enterClock();
+    }
+  } else {
+    // STATE_IDLE atau STATE_ANSWERED -> dianggap posisi "AI" di loop.
+    if (forward) {
+      enterClock();
+    } else {
+      enterSettingsHome();
+    }
+  }
+}
+
 enum SettingItem {
   SET_BRIGHTNESS, SET_VOLUME, SET_WIFI, SET_TIMEOUT, SET_BATTERY, SET_FIRMWARE,
   SET_COUNT
@@ -637,10 +696,7 @@ void enterSettings() {
 
 void exitSettings() {
   saveSettings();
-  state = STATE_IDLE;
-  lastActivityAt = millis();
-  drawRobotFace("Siap! Tekan tombol");
-  scheduleIdleAnim();
+  enterSettingsHome();  // balik satu level, ke layar launcher "Pengaturan"
 }
 
 void enterSettingsEdit() {
@@ -1000,8 +1056,8 @@ void loop() {
   if (askSingle || askDouble || upPressed || downPressed) {
     wakeScreen();  // tombol apa pun membangunkan layar kalau sempat mati (timeout)
   }
-  // --- Klik-ganda ASK dari standby/jawaban = buka menu Pengaturan ---
-  if (askDouble && (state == STATE_IDLE || state == STATE_ANSWERED)) {
+  // --- Klik-ganda ASK di layar "Pengaturan" (launcher) = masuk LIST ---
+  if (askDouble && state == STATE_SETTINGS_HOME) {
     enterSettings();
   }
   // Klik-ganda ASK di LIST, pada item yang bisa diubah = masuk mode edit.
@@ -1011,13 +1067,15 @@ void loop() {
     }
     // item read-only (WiFi/Baterai/Firmware): klik-ganda tidak ngapa-ngapain
   }
-  // Klik-tunggal ASK: mulai tanya (dari IDLE/ANSWERED/CLOCK -- menekan ASK
-  // saat lagi lihat jam langsung membatalkan jam & mulai tanya).
+  // Klik-tunggal ASK: mulai tanya (dari layar rumah manapun -- AI/jawaban/
+  // Jam/Pengaturan -- menekan ASK langsung membatalkan & mulai tanya).
   else if (askSingle &&
-           (state == STATE_IDLE || state == STATE_ANSWERED || state == STATE_CLOCK)) {
+           (state == STATE_IDLE || state == STATE_ANSWERED ||
+            state == STATE_CLOCK || state == STATE_SETTINGS_HOME)) {
     enterListening();
   }
-  // Klik-tunggal ASK di LIST Pengaturan = keluar, balik ke standby.
+  // Klik-tunggal ASK di LIST Pengaturan = keluar satu level, balik ke
+  // layar "Pengaturan" (launcher).
   else if (askSingle && state == STATE_SETTINGS) {
     exitSettings();
   }
@@ -1055,10 +1113,11 @@ void loop() {
       }
       settingsLastActivity = millis();
       drawSettingsScreen(true);
-    } else if (state == STATE_IDLE || state == STATE_ANSWERED) {
-      enterClock();
-    } else if (state == STATE_CLOCK) {
-      clockShownAt = millis();  // reset timer auto-kembali
+    } else if (state == STATE_IDLE || state == STATE_ANSWERED ||
+               state == STATE_CLOCK || state == STATE_SETTINGS_HOME) {
+      // Loop 3 layar rumah: AI -> Jam -> Pengaturan -> AI -> ... (UP=maju,
+      // DOWN=mundur).
+      enterNextHomeScreen(upPressed);
     }
   }
 
@@ -1121,18 +1180,12 @@ void loop() {
     updateIdleFace();
   }
 
-  // --- Layar jam: refresh tiap detik, auto-kembali ke standby setelah
-  // CLOCK_TIMEOUT_MS tanpa tombol UP/DOWN ditekan lagi ---
+  // --- Layar jam: refresh tiap detik (bagian dari loop 3 layar rumah,
+  // tidak lagi auto-kembali sendiri -- pindah layar lewat UP/DOWN) ---
   if (state == STATE_CLOCK) {
     if (millis() - clockLastTick > 1000) {
       clockLastTick = millis();
       drawClockScreen();
-    }
-    if (millis() - clockShownAt > CLOCK_TIMEOUT_MS) {
-      state = STATE_IDLE;
-      lastActivityAt = millis();
-      drawRobotFace("Siap! Tekan tombol");
-      scheduleIdleAnim();
     }
   }
 

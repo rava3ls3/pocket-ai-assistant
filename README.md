@@ -23,15 +23,28 @@ tombol fisik (ASK, UP, DOWN) tanpa sesak.
 **3 tombol:**
 | Tombol | Pin | Klik tunggal | Klik GANDA (2x tekan dalam ≤1 detik) | Fungsi nanti (hardware asli + speaker) |
 |---|---|---|---|---|
-| ASK | D0 | Push-to-talk (mulai tanya ke AI), atau "kembali" selama di dalam menu Pengaturan | Buka menu **Pengaturan** (dari standby/jawaban), atau masuk mode edit nilai item | Sama |
-| UP | D1 | Tampilkan jam (NTP) / pindah item berikutnya (list) / naikkan nilai (mode edit) | — | Volume up |
-| DOWN | D3 | Tampilkan jam (NTP) / pindah item sebelumnya (list) / turunkan nilai (mode edit) | — | Volume down |
+| ASK | D0 | Push-to-talk (mulai tanya ke AI dari layar rumah manapun), atau "kembali" selama di dalam menu Pengaturan | Khusus di layar **Pengaturan**: masuk LIST. Khusus di LIST (item yg bisa diubah): masuk mode edit nilai | Sama |
+| UP | D1 | **Maju** 1 langkah di loop layar rumah (AI → Jam → Pengaturan → AI → ...) / pindah item berikutnya (LIST) / naikkan nilai (mode edit) | — | Volume up |
+| DOWN | D3 | **Mundur** 1 langkah di loop layar rumah (AI → Pengaturan → Jam → AI → ...) / pindah item sebelumnya (LIST) / turunkan nilai (mode edit) | — | Volume down |
 
-Tekan ASK kapan saja (termasuk saat sedang lihat jam) untuk langsung mulai
-tanya. Tekan UP/DOWN untuk lihat jam — otomatis balik ke wajah robot standby
-setelah 5 detik tanpa tombol ditekan lagi. Klik ASK dua kali cepat (≤1 detik
-antar klik) dari layar standby/jawaban untuk membuka menu **Pengaturan**
-(lihat bagian terpisah di bawah).
+**Navigasi utama pakai UP/DOWN**, bukan klik-ganda langsung dari mana saja —
+klik-ganda dari sembarang layar ternyata terasa sulit/kurang jelas waktu
+dicoba. Sekarang ada 3 "layar rumah" yang di-loop pakai UP/DOWN:
+
+```
+   ┌──────┐   UP   ┌─────┐   UP   ┌─────────────┐
+   │  AI  │ ─────> │ Jam │ ─────> │ Pengaturan  │
+   │(idle)│ <───── │     │ <───── │ (launcher)  │
+   └──────┘  DOWN  └─────┘  DOWN  └─────────────┘
+       ^                                 │
+       └─────────── UP (loop balik) ─────┘
+```
+
+Tekan ASK kapan saja (di layar rumah manapun) untuk langsung mulai tanya.
+Begitu berada TEPAT di layar **Pengaturan**, klik ASK dua kali cepat (≤1
+detik antar klik) untuk masuk menu (lihat bagian terpisah di bawah) —
+karena klik-ganda cuma perlu dipakai pas sudah lihat layar yang tepat,
+jauh lebih gampang ditimpali drpd klik-ganda "buta" dari standby.
 
 > Karena klik tunggal dan klik ganda sama-sama dimulai dengan menekan ASK,
 > firmware perlu menunggu sampai ~1 detik setelah tiap klik tunggal untuk
@@ -103,15 +116,22 @@ gambar/bitmap terpisah):
 
 ## Menu Pengaturan
 
-Klik tombol **ASK** dua kali cepat (≤1 detik antar klik) dari layar standby
-atau layar jawaban untuk membuka menu Pengaturan — navigasinya dua tingkat:
+Navigasinya tiga tingkat:
+
+**Tingkat HOME** (layar "Pengaturan", salah satu dari 3 layar rumah —
+lihat loop AI→Jam→Pengaturan di atas):
+- **UP / DOWN** → pindah ke layar rumah lain (loop AI↔Jam↔Pengaturan)
+- **ASK (klik ganda, ≤1 detik)** → masuk tingkat LIST
+- **ASK (klik tunggal)** → langsung mulai tanya ke AI (sama seperti di
+  layar rumah lain)
 
 **Tingkat LIST** (daftar 6 item):
 - **UP / DOWN** → pindah ke item berikutnya/sebelumnya
 - **ASK (klik ganda)** → masuk mode edit item yang sedang dipilih (hanya
   untuk item yang bisa diubah: Kecerahan/Volume/Timeout layar — klik ganda
   di item info-saja seperti WiFi tidak ngapa-ngapain)
-- **ASK (klik tunggal)** → keluar dari menu, balik ke standby
+- **ASK (klik tunggal)** → keluar satu tingkat, balik ke layar HOME
+  (Pengaturan)
 
 **Tingkat EDIT** (sedang mengubah nilai 1 item, header layar berubah jadi
 "Edit X/6"):
@@ -119,8 +139,8 @@ atau layar jawaban untuk membuka menu Pengaturan — navigasinya dua tingkat:
 - **ASK (klik tunggal)** → kembali ke tingkat LIST (nilai sudah otomatis
   tersimpan)
 
-Di kedua tingkat, otomatis keluar & simpan ke NVS kalau tidak ada tombol
-ditekan selama 15 detik.
+Di tingkat LIST maupun EDIT, otomatis keluar satu tingkat & simpan ke NVS
+kalau tidak ada tombol ditekan selama 15 detik.
 
 6 item yang bisa dilihat/diatur:
 | Item | Bisa diubah? | Keterangan |
@@ -183,8 +203,10 @@ pocket-ai-assistant/
    `Jam berapa sekarang di Jakarta kalau di London jam 9 pagi?`
 4. OLED akan menampilkan animasi "Mikir...", lalu jawaban singkat dari Nemotron.
    Jawaban lengkap selalu tercetak penuh di Serial Monitor.
-5. Tekan tombol **biru (UP/DOWN)** kapan saja untuk melihat jam (NTP).
-6. Tekan ASK lagi untuk bertanya hal baru.
+5. Tekan tombol **biru (UP)** kapan saja untuk pindah ke layar Jam (NTP),
+   tekan UP/DOWN lagi untuk lanjut ke layar Pengaturan, dan seterusnya
+   berputar (AI → Jam → Pengaturan → AI → ...).
+6. Tekan ASK lagi (klik tunggal) dari layar manapun untuk bertanya hal baru.
 
 ## Tanya/baca jawaban panjang lewat HP (opsional, via Home Assistant + Firebase)
 
